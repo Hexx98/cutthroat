@@ -17,10 +17,10 @@ local ADDON_NAME = ...
 local SND_SPELL_IDS = { [5171] = true, [6774] = true } -- ranks 1 and 2
 local SND_BASE_SECONDS = { 9, 12, 15, 18, 21 }          -- per combo point, before talents
 local PIP_COUNT = 5
-local PIP_SIZE, PIP_GAP = 22, 4
+local PIP_WIDTH, PIP_HEIGHT, PIP_GAP = 30, 22, 4
 local BAR_HEIGHT = 14
 local SND_COLOR = { 0.35, 0.80, 0.25 }
-local WARN_SECONDS = 3       -- bar turns red and pulses below this
+local WARN_SECONDS = 5       -- bar turns red and pulses below this
 local WARN_PULSE_HZ = 2.5
 local WHITE = "Interface\\Buttons\\WHITE8X8"
 local PIP_COLORS = {
@@ -85,10 +85,10 @@ local function makeBar(parent, width, height)
     return holder, bar
 end
 
-local width = PIP_COUNT * PIP_SIZE + (PIP_COUNT - 1) * PIP_GAP
+local width = PIP_COUNT * PIP_WIDTH + (PIP_COUNT - 1) * PIP_GAP
 
 local root = CreateFrame("Frame", "CutthroatFrame", UIParent)
-root:SetSize(width, PIP_SIZE + PIP_GAP + BAR_HEIGHT)
+root:SetSize(width, PIP_HEIGHT + PIP_GAP + BAR_HEIGHT)
 root:SetClampedToScreen(true)
 root:SetMovable(true)
 root:RegisterForDrag("LeftButton")
@@ -104,8 +104,8 @@ hint:SetText("Cutthroat: drag to move, then /cut lock")
 
 local pips = {}
 for i = 1, PIP_COUNT do
-    local holder, bar = makeBar(root, PIP_SIZE, PIP_SIZE)
-    holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_SIZE + PIP_GAP), -(BAR_HEIGHT + PIP_GAP))
+    local holder, bar = makeBar(root, PIP_WIDTH, PIP_HEIGHT)
+    holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_WIDTH + PIP_GAP), -(BAR_HEIGHT + PIP_GAP))
     bar:SetStatusBarColor(unpack(PIP_COLORS[i]))
     bar:SetMinMaxValues(i - 1, i)
     bar:SetValue(0)
