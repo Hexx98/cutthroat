@@ -27,7 +27,15 @@ local PIP_COLORS = {
     { 1.00, 0.82, 0.10 }, { 1.00, 0.82, 0.10 }, { 1.00, 0.82, 0.10 },
     { 1.00, 0.55, 0.10 }, { 1.00, 0.25, 0.10 },
 }
-local DEFAULTS = { locked = false, scale = 1, sndMult = 1, point = { "CENTER", "CENTER", 0, -180 } }
+local DEFAULTS = {
+    locked = false, scale = 1, sndMult = 1, pipShape = "square",
+    point = { "CENTER", "CENTER", 0, -180 },
+}
+-- media\<shape>.tga is the fill; media\<shape>_border.tga is the same shape grown for the outline
+local SHAPES = { "square", "circle", "diamond", "triangle", "star" }
+local SHAPE_SET = {}
+for _, shape in ipairs(SHAPES) do SHAPE_SET[shape] = true end
+local MEDIA = "Interface\\AddOns\\" .. ADDON_NAME .. "\\media\\"
 local PREFIX = "|cff66ccffCutthroat:|r "
 
 local db
@@ -102,15 +110,41 @@ local hint = root:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 hint:SetPoint("BOTTOM", root, "TOP", 0, 6)
 hint:SetText("Cutthroat: drag to move, then /cut lock")
 
+-- Each pip is two StatusBars ranged [i-1, i] - the outline behind, the colored fill in
+-- front - both handed the secret combo point count. The engine draws each one completely
+-- or not at all, so a pip, outline included, only appears once that combo point is
+-- earned. While unlocked, a faint "ghost" of every pip shows so the bar can be placed.
 local pips = {}
 for i = 1, PIP_COUNT do
-    local holder, bar = makeBar(root, PIP_WIDTH, PIP_HEIGHT)
+    local holder = CreateFrame("Frame", nil, root)
+    holder:SetSize(PIP_WIDTH, PIP_HEIGHT)
     holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_WIDTH + PIP_GAP), -(BAR_HEIGHT + PIP_GAP))
-    bar:SetStatusBarColor(unpack(PIP_COLORS[i]))
-    bar:SetMinMaxValues(i - 1, i)
-    bar:SetValue(0)
-    pips[i] = bar
+    local ghost = holder:CreateTexture(nil, "BACKGROUND")
+    ghost:SetAllPoints()
+    local function gatedBar(levelOffset)
+        local bar = CreateFrame("StatusBar", nil, holder)
+        bar:SetAllPoints()
+        bar:SetFrameLevel(holder:GetFrameLevel() + levelOffset)
+        bar:SetMinMaxValues(i - 1, i)
+        bar:SetValue(0)
+        return bar
+    end
+    pips[i] = { ghost = ghost, outline = gatedBar(1), fill = gatedBar(2) }
 end
+
+local function applyShape()
+    local shape = db and db.pipShape or DEFAULTS.pipShape
+    local fill, border = MEDIA .. shape .. ".tga", MEDIA .. shape .. "_border.tga"
+    for i, pip in ipairs(pips) do
+        pip.ghost:SetTexture(border)
+        pip.ghost:SetVertexColor(0.6, 0.6, 0.6, 0.35)
+        pip.outline:SetStatusBarTexture(border)
+        pip.outline:SetStatusBarColor(0, 0, 0, 1)
+        pip.fill:SetStatusBarTexture(fill)
+        pip.fill:SetStatusBarColor(unpack(PIP_COLORS[i]))
+    end
+end
+applyShape()
 
 -- Slice and Dice area: an idle placeholder plus five gated countdowns stacked on top
 local sndHolder = CreateFrame("Frame", nil, root)
@@ -158,7 +192,10 @@ local function updateComboPoints()
     -- Secret number: never compared, only handed to the bars.
     -- `or` is a truthiness test, which the client allows on secrets.
     local cp = GetComboPoints("player", "target") or 0
-    for i = 1, PIP_COUNT do pips[i]:SetValue(cp) end
+    for _, pip in ipairs(pips) do
+        pip.outline:SetValue(cp)
+        pip.fill:SetValue(cp)
+    end
 end
 
 -- ---------------------------------------------------------------- slice and dice
@@ -285,6 +322,7 @@ local function applyLock()
     root:EnableMouse(unlocked)
     overlay:SetShown(unlocked)
     hint:SetShown(unlocked)
+    for _, pip in ipairs(pips) do pip.ghost:SetShown(unlocked) end
     refreshSndVisibility()
 end
 
@@ -324,6 +362,8 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         for k, v in pairs(DEFAULTS) do
             if db[k] == nil then db[k] = v end
         end
+        if not SHAPE_SET[db.pipShape] then db.pipShape = DEFAULTS.pipShape end
+        applyShape()
         applyPosition()
         applyLock()
         root:UnregisterEvent("ADDON_LOADED")
@@ -364,6 +404,12 @@ local function setScale(scale)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
+local function setShape(shape)
+    db.pipShape = shape
+    applyShape()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
 local function resetPosition()
     db.point = { unpack(DEFAULTS.point) }
     db.scale = 1
@@ -390,7 +436,7 @@ end
 
 local function buildPanel()
     local p = CreateFrame("Frame", "CutthroatOptions", UIParent)
-    p:SetSize(280, 196)
+    p:SetSize(280, 232)
     p:SetPoint("CENTER")
     p:SetFrameStrata("DIALOG")
     p:SetClampedToScreen(true)
@@ -461,13 +507,49 @@ local function buildPanel()
         end
     end)
 
+    -- pip shape: one icon button per shape
+    local shapeLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    shapeLabel:SetPoint("TOPLEFT", 14, -118)
+    shapeLabel:SetText("Pip shape")
+    local shapeButtons = {}
+    for idx, shape in ipairs(SHAPES) do
+        local b = CreateFrame("Button", nil, p)
+        b:SetSize(24, 24)
+        b:SetPoint("TOPRIGHT", -14 - (#SHAPES - idx) * 30, -112)
+        local selected = b:CreateTexture(nil, "BACKGROUND")
+        selected:SetPoint("TOPLEFT", -3, 3)
+        selected:SetPoint("BOTTOMRIGHT", 3, -3)
+        selected:SetColorTexture(1, 1, 1, 0.25)
+        local outline = b:CreateTexture(nil, "BORDER")
+        outline:SetAllPoints()
+        outline:SetTexture(MEDIA .. shape .. "_border.tga")
+        outline:SetVertexColor(0, 0, 0, 1)
+        local icon = b:CreateTexture(nil, "ARTWORK")
+        icon:SetAllPoints()
+        icon:SetTexture(MEDIA .. shape .. ".tga")
+        icon:SetVertexColor(unpack(PIP_COLORS[1]))
+        local hl = b:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetPoint("TOPLEFT", -3, 3)
+        hl:SetPoint("BOTTOMRIGHT", 3, -3)
+        hl:SetColorTexture(1, 1, 1, 0.12)
+        b:SetScript("OnClick", function() setShape(shape) end)
+        b:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:SetText((shape:gsub("^%l", string.upper)))
+            GameTooltip:Show()
+        end)
+        b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        b.selected = selected
+        shapeButtons[shape] = b
+    end
+
     -- reset
     local resetButton = makeButton(p, "Reset position and scale", 252, resetPosition)
-    resetButton:SetPoint("TOPLEFT", 14, -114)
+    resetButton:SetPoint("TOPLEFT", 14, -150)
 
     -- read-only info
     local info = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    info:SetPoint("TOPLEFT", 14, -150)
+    info:SetPoint("TOPLEFT", 14, -186)
     info:SetPoint("RIGHT", -14, 0)
     info:SetJustifyH("LEFT")
 
@@ -475,6 +557,7 @@ local function buildPanel()
         lockButton.text:SetText(db.locked and "Locked" or "Unlocked (drag the bar)")
         slider:SetValue(db.scale)
         scaleLabel:SetFormattedText("Scale  %.2f", db.scale)
+        for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
         if math.abs(db.sndMult - 1) < 0.001 then
             info:SetText("Slice and Dice talent bonus: not learned yet\n(learned after your first Slice and Dice out of combat)")
         else
@@ -511,6 +594,13 @@ SlashCmdList.CUTTHROAT = function(msg)
     elseif cmd == "reset" then
         resetPosition()
         print(PREFIX .. "position and scale reset.")
+    elseif cmd == "shape" then
+        if SHAPE_SET[arg] then
+            setShape(arg)
+            print(PREFIX .. "pip shape " .. arg)
+        else
+            print(PREFIX .. "usage: /cut shape " .. table.concat(SHAPES, " | "))
+        end
     elseif cmd == "scale" then
         local n = tonumber(arg)
         if n and n >= SCALE_MIN and n <= SCALE_MAX then
@@ -520,6 +610,6 @@ SlashCmdList.CUTTHROAT = function(msg)
             print(PREFIX .. "usage: /cut scale 0.5-3  (e.g. /cut scale 1.5)")
         end
     else
-        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale <0.5-3>")
+        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale <0.5-3> | shape <name>")
     end
 end
