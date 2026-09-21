@@ -17,8 +17,8 @@ local ADDON_NAME = ...
 local SND_SPELL_IDS = { [5171] = true, [6774] = true } -- ranks 1 and 2
 local SND_BASE_SECONDS = { 9, 12, 15, 18, 21 }          -- per combo point, before talents
 local PIP_COUNT = 5
-local PIP_WIDTH, PIP_HEIGHT, PIP_GAP = 30, 22, 4
-local BAR_HEIGHT = 14
+local PIP_WIDTH, PIP_HEIGHT, PIP_GAP = 22, 22, 4
+local BAR_HEIGHT = 20
 local SND_COLOR = { 0.35, 0.80, 0.25 }
 local WARN_SECONDS = 5       -- bar turns red and pulses below this
 local WARN_PULSE_HZ = 2.5
