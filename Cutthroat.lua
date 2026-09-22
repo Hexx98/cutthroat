@@ -310,10 +310,16 @@ local function syncFromBuff()
 end
 
 -- ---------------------------------------------------------------- position and lock
+-- Re-anchors the bar at the saved point: only at load and on reset. WoW's layout cache
+-- may have restored a dragged position that a lost saved point knows nothing about.
 local function applyPosition()
     local p = db.point
     root:ClearAllPoints()
     root:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+    root:SetScale(db.scale)
+end
+
+local function applyScale()
     root:SetScale(db.scale)
 end
 
@@ -332,6 +338,46 @@ root:SetScript("OnDragStop", function(self)
     local point, _, relPoint, x, y = self:GetPoint()
     db.point = { point, relPoint, x, y }
 end)
+
+-- ---------------------------------------------------------------- layout-cache settings store
+-- This beta sometimes stops loading SavedVariables back in, for every addon. WoW's layout
+-- cache - which remembers where you dragged named frames - has kept working throughout, so
+-- lock, shape and scale are also encoded as the position of an invisible, named helper
+-- frame: x = shape index (+10 when locked), y = scale x 100. Whole numbers, because the
+-- cache rounds offsets. Saved settings stay the primary store; this only fills the gap.
+local SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.5, 3, 0.05
+local store = CreateFrame("Frame", "CutthroatSettingsStore", UIParent)
+store:SetSize(1, 1)
+store:SetAlpha(0)
+store:EnableMouse(false)
+store:SetMovable(true) -- required for WoW to remember its position
+local storeRead = false
+
+local function writeStore()
+    local shapeIndex = 1
+    for i, shape in ipairs(SHAPES) do
+        if shape == db.pipShape then shapeIndex = i end
+    end
+    store:ClearAllPoints()
+    store:SetPoint("CENTER", UIParent, "CENTER",
+        shapeIndex + (db.locked and 10 or 0), math.floor(db.scale * 100 + 0.5))
+    store:SetUserPlaced(true)
+end
+
+-- Takes lock/shape/scale from the layout cache once WoW has restored the helper frame.
+local function readStore()
+    if storeRead or not db or store:GetNumPoints() == 0 then return end
+    local _, _, _, x, y = store:GetPoint(1)
+    if not (x and y) then return end
+    x, y = math.floor(x + 0.5), math.floor(y + 0.5)
+    local shape, scale = SHAPES[x % 10], y / 100
+    if not shape or x < 1 or x > 15 or scale < SCALE_MIN or scale > SCALE_MAX then return end
+    storeRead = true
+    db.pipShape, db.locked, db.scale = shape, x > 10, scale
+    applyShape()
+    applyScale()
+    applyLock()
+end
 
 -- ---------------------------------------------------------------- events
 local function registerPlayerEvent(event)
@@ -366,6 +412,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         applyShape()
         applyPosition()
         applyLock()
+        readStore() -- in case the layout cache was applied before us
         root:UnregisterEvent("ADDON_LOADED")
     elseif event == "PLAYER_LOGOUT" then
         if db then
@@ -381,6 +428,12 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
     elseif event == "UNIT_AURA" then
         if unit == "player" then syncFromBuff() end
     else -- PLAYER_ENTERING_WORLD, PLAYER_TARGET_CHANGED, PLAYER_REGEN_ENABLED
+        if event == "PLAYER_ENTERING_WORLD" then
+            -- the layout cache is applied shortly after addons load; look a few times
+            readStore()
+            C_Timer.After(1, guard("readStore", readStore))
+            C_Timer.After(3, guard("readStore", readStore))
+        end
         updateComboPoints()
         syncFromBuff()
     end
@@ -389,24 +442,26 @@ end))
 -- ---------------------------------------------------------------- settings panel
 -- Built from plain widgets rather than Blizzard option templates, which this client has
 -- been dropping; also matches the bar's flat look. Created on first open.
-local SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.5, 3, 0.05
 local panel
 
 local function setLocked(locked)
     db.locked = locked
     applyLock()
+    writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
 local function setScale(scale)
     db.scale = scale
-    applyPosition()
+    applyScale()
+    writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
 local function setShape(shape)
     db.pipShape = shape
     applyShape()
+    writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -414,6 +469,7 @@ local function resetPosition()
     db.point = { unpack(DEFAULTS.point) }
     db.scale = 1
     applyPosition()
+    writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -503,7 +559,8 @@ local function buildPanel()
         scaleLabel:SetFormattedText("Scale  %.2f", value)
         if db and math.abs(value - db.scale) > 0.001 then
             db.scale = value
-            applyPosition()
+            applyScale()
+            writeStore()
         end
     end)
 
