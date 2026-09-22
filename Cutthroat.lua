@@ -28,7 +28,7 @@ local PIP_COLORS = {
     { 1.00, 0.55, 0.10 }, { 1.00, 0.25, 0.10 },
 }
 local DEFAULTS = {
-    locked = false, scale = 1, sndMult = 1, pipShape = "square",
+    locked = false, scale = 1, sndMult = 1, pipShape = "square", pipsOnTop = false,
     point = { "CENTER", "CENTER", 0, -180 },
 }
 -- media\<shape>.tga is the fill; media\<shape>_border.tga is the same shape grown for the outline
@@ -129,7 +129,7 @@ for i = 1, PIP_COUNT do
         bar:SetValue(0)
         return bar
     end
-    pips[i] = { ghost = ghost, outline = gatedBar(1), fill = gatedBar(2) }
+    pips[i] = { holder = holder, ghost = ghost, outline = gatedBar(1), fill = gatedBar(2) }
 end
 
 local function applyShape()
@@ -185,6 +185,20 @@ for i = 1, PIP_COUNT do
     holder:Hide()
 
     timers[i] = { gate = gate, holder = holder, bar = bar, text = text, length = 0 }
+end
+
+-- Combo points below the Slice and Dice bar (default) or above it. Only the two rows
+-- swap; the frame's overall size and position stay the same, so it doesn't jump.
+local function applyLayout()
+    local top = db and db.pipsOnTop
+    local pipY = top and 0 or -(BAR_HEIGHT + PIP_GAP)
+    local barY = top and -(PIP_HEIGHT + PIP_GAP) or 0
+    for i, pip in ipairs(pips) do
+        pip.holder:ClearAllPoints()
+        pip.holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_WIDTH + PIP_GAP), pipY)
+    end
+    sndHolder:ClearAllPoints()
+    sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", 0, barY)
 end
 
 -- ---------------------------------------------------------------- combo points
@@ -342,9 +356,11 @@ end)
 -- ---------------------------------------------------------------- layout-cache settings store
 -- This beta sometimes stops loading SavedVariables back in, for every addon. WoW's layout
 -- cache - which remembers where you dragged named frames - has kept working throughout, so
--- lock, shape and scale are also encoded as the position of an invisible, named helper
--- frame: x = shape index (+10 when locked), y = scale x 100. Whole numbers, because the
--- cache rounds offsets. Saved settings stay the primary store; this only fills the gap.
+-- lock, shape, scale and pip placement are also encoded as the position of an invisible,
+-- named helper frame: x = shape index (+10 when locked, +20 when pips are above the bar),
+-- y = scale x 100. Whole numbers, because the cache rounds offsets. Older values (1-15)
+-- decode as "pips below", so existing settings carry over. Saved settings stay the
+-- primary store; this only fills the gap.
 local SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.5, 3, 0.05
 local store = CreateFrame("Frame", "CutthroatSettingsStore", UIParent)
 store:SetSize(1, 1)
@@ -360,7 +376,7 @@ local function writeStore()
     end
     store:ClearAllPoints()
     store:SetPoint("CENTER", UIParent, "CENTER",
-        shapeIndex + (db.locked and 10 or 0), math.floor(db.scale * 100 + 0.5))
+        shapeIndex + (db.locked and 10 or 0) + (db.pipsOnTop and 20 or 0), math.floor(db.scale * 100 + 0.5))
     store:SetUserPlaced(true)
 end
 
@@ -370,13 +386,17 @@ local function readStore()
     local _, _, _, x, y = store:GetPoint(1)
     if not (x and y) then return end
     x, y = math.floor(x + 0.5), math.floor(y + 0.5)
-    local shape, scale = SHAPES[x % 10], y / 100
-    if not shape or x < 1 or x > 15 or scale < SCALE_MIN or scale > SCALE_MAX then return end
+    if x < 1 or x > 35 then return end
+    local onTop = x > 20
+    local rest = onTop and (x - 20) or x
+    local shape, scale = SHAPES[rest % 10], y / 100
+    if not shape or rest > 15 or scale < SCALE_MIN or scale > SCALE_MAX then return end
     storeRead = true
-    db.pipShape, db.locked, db.scale = shape, x > 10, scale
+    db.pipShape, db.locked, db.scale, db.pipsOnTop = shape, rest > 10, scale, onTop
     applyShape()
     applyScale()
     applyLock()
+    applyLayout()
 end
 
 -- ---------------------------------------------------------------- events
@@ -410,6 +430,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         end
         if not SHAPE_SET[db.pipShape] then db.pipShape = DEFAULTS.pipShape end
         applyShape()
+        applyLayout()
         applyPosition()
         applyLock()
         readStore() -- in case the layout cache was applied before us
@@ -465,6 +486,13 @@ local function setShape(shape)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
+local function setPipsOnTop(onTop)
+    db.pipsOnTop = onTop
+    applyLayout()
+    writeStore()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
 local function resetPosition()
     db.point = { unpack(DEFAULTS.point) }
     db.scale = 1
@@ -492,7 +520,7 @@ end
 
 local function buildPanel()
     local p = CreateFrame("Frame", "CutthroatOptions", UIParent)
-    p:SetSize(280, 232)
+    p:SetSize(280, 266)
     p:SetPoint("CENTER")
     p:SetFrameStrata("DIALOG")
     p:SetClampedToScreen(true)
@@ -600,13 +628,20 @@ local function buildPanel()
         shapeButtons[shape] = b
     end
 
+    -- combo points above or below the Slice and Dice bar
+    local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    layoutLabel:SetPoint("TOPLEFT", 14, -156)
+    layoutLabel:SetText("Combo points")
+    local layoutButton = makeButton(p, "", 150, function() setPipsOnTop(not db.pipsOnTop) end)
+    layoutButton:SetPoint("TOPRIGHT", -14, -152)
+
     -- reset
     local resetButton = makeButton(p, "Reset position and scale", 252, resetPosition)
-    resetButton:SetPoint("TOPLEFT", 14, -150)
+    resetButton:SetPoint("TOPLEFT", 14, -188)
 
     -- read-only info
     local info = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    info:SetPoint("TOPLEFT", 14, -186)
+    info:SetPoint("TOPLEFT", 14, -222)
     info:SetPoint("RIGHT", -14, 0)
     info:SetJustifyH("LEFT")
 
@@ -615,6 +650,7 @@ local function buildPanel()
         slider:SetValue(db.scale)
         scaleLabel:SetFormattedText("Scale  %.2f", db.scale)
         for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
+        layoutButton.text:SetText(db.pipsOnTop and "Above the bar" or "Below the bar")
         if math.abs(db.sndMult - 1) < 0.001 then
             info:SetText("Slice and Dice talent bonus: not learned yet\n(learned after your first Slice and Dice out of combat)")
         else
@@ -640,7 +676,7 @@ SlashCmdList.CUTTHROAT = function(msg)
         local ok, err = pcall(togglePanel)
         if not ok then
             print(PREFIX .. "settings panel failed to open: " .. tostring(err))
-            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n>")
+            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | pips above|below")
         end
     elseif cmd == "lock" then
         setLocked(true)
@@ -658,6 +694,16 @@ SlashCmdList.CUTTHROAT = function(msg)
         else
             print(PREFIX .. "usage: /cut shape " .. table.concat(SHAPES, " | "))
         end
+    elseif cmd == "pips" then
+        if arg == "above" or arg == "top" then
+            setPipsOnTop(true)
+            print(PREFIX .. "combo points above the Slice and Dice bar.")
+        elseif arg == "below" or arg == "bottom" then
+            setPipsOnTop(false)
+            print(PREFIX .. "combo points below the Slice and Dice bar.")
+        else
+            print(PREFIX .. "usage: /cut pips above | below")
+        end
     elseif cmd == "scale" then
         local n = tonumber(arg)
         if n and n >= SCALE_MIN and n <= SCALE_MAX then
@@ -667,6 +713,6 @@ SlashCmdList.CUTTHROAT = function(msg)
             print(PREFIX .. "usage: /cut scale 0.5-3  (e.g. /cut scale 1.5)")
         end
     else
-        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale <0.5-3> | shape <name>")
+        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale <0.5-3> | shape <name> | pips above|below")
     end
 end
