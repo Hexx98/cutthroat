@@ -18,7 +18,7 @@ WoW Forever hides combat data from addons ("secret values"):
 - **Buffs cannot be read at all in combat.** So the Slice and Dice timer is built from the cast instead: the cast events still report the spell ID, and on each cast Cutthroat starts five countdowns, one per possible combo point count. Five invisible "gate" bars get the secret combo point count (the pip trick again) and each countdown is clipped to its gate's fill, so the highest visible countdown is the right one.
 - **Out of combat** buffs are readable again, so the timer re-syncs to the real buff and learns the Improved Slice and Dice talent bonus from it.
 
-Settings are saved per character: this beta currently does not load account-wide saved variables back in.
+Settings are saved per character. This beta intermittently stops loading addon saved variables back in, so lock, shape and scale are also mirrored into WoW's frame-position (layout) cache, which has kept working: they are encoded as the position of an invisible helper frame, `CutthroatSettingsStore`.
 
 ## Install
 

@@ -1,7 +1,7 @@
 ## Interface: 16001
 ## Title: Cutthroat
 ## Notes: Combo point pips and a Slice and Dice timer.
-## Version: 0.6.0
+## Version: 0.7.0
 ## SavedVariablesPerCharacter: CutthroatDB
 
 Cutthroat.lua
