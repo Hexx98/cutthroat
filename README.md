@@ -8,7 +8,8 @@ Combo point pips and a Slice and Dice timer for rogues on **WoW Forever** (clien
 - Five pip shapes: square, circle, diamond, triangle, star.
 - Slice and Dice countdown bar above the pips. It starts the moment you cast, counts down in combat, and turns red and pulses for the last 5 seconds.
 - Move it anywhere, then lock it. Scale 0.5–3.
-- Settings panel: `/cut` or `/cutthroat`. Typed commands: `/cut lock | unlock | reset | scale <n> | shape <name>`.
+- Settings panel: `/cut` or `/cutthroat`. Typed commands: `/cut lock | unlock | reset | scale <n> | shape <name> | pips above|below`.
+- Combo points can sit below the Slice and Dice bar (default) or above it: settings panel, or `/cut pips above`.
 
 ## How it works on this client
 
