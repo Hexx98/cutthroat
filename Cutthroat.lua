@@ -28,7 +28,7 @@ local PIP_COLORS = {
     { 1.00, 0.55, 0.10 }, { 1.00, 0.25, 0.10 },
 }
 local DEFAULTS = {
-    locked = false, scale = 1, sndMult = 1, pipShape = "square", pipsOnTop = false,
+    locked = false, scale = 1, width = 1, height = 1, sndMult = 1, pipShape = "square", pipsOnTop = false,
     point = { "CENTER", "CENTER", 0, -180 },
 }
 -- media\<shape>.tga is the fill; media\<shape>_border.tga is the same shape grown for the outline
@@ -119,7 +119,10 @@ for i = 1, PIP_COUNT do
     local holder = CreateFrame("Frame", nil, root)
     holder:SetSize(PIP_WIDTH, PIP_HEIGHT)
     holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_WIDTH + PIP_GAP), -(BAR_HEIGHT + PIP_GAP))
-    local ghost = holder:CreateTexture(nil, "BACKGROUND")
+    -- two unlocked-only preview layers: a dark border under a colour fill (see applyShape)
+    local ghostBorder = holder:CreateTexture(nil, "BACKGROUND", nil, 0)
+    ghostBorder:SetAllPoints()
+    local ghost = holder:CreateTexture(nil, "BACKGROUND", nil, 1)
     ghost:SetAllPoints()
     local function gatedBar(levelOffset)
         local bar = CreateFrame("StatusBar", nil, holder)
@@ -129,15 +132,21 @@ for i = 1, PIP_COUNT do
         bar:SetValue(0)
         return bar
     end
-    pips[i] = { holder = holder, ghost = ghost, outline = gatedBar(1), fill = gatedBar(2) }
+    pips[i] = { holder = holder, ghost = ghost, ghostBorder = ghostBorder, outline = gatedBar(1), fill = gatedBar(2) }
 end
 
 local function applyShape()
     local shape = db and db.pipShape or DEFAULTS.pipShape
     local fill, border = MEDIA .. shape .. ".tga", MEDIA .. shape .. "_border.tga"
     for i, pip in ipairs(pips) do
-        pip.ghost:SetTexture(border)
-        pip.ghost:SetVertexColor(0.6, 0.6, 0.6, 0.35)
+        -- Ghost is the unlocked-only preview: each pip solid in its real colour, with a dark
+        -- border underneath, so all five are easy to see and line up against other bars. It's
+        -- hidden the instant you lock, leaving only real combo points.
+        local c = PIP_COLORS[i]
+        pip.ghostBorder:SetTexture(border)
+        pip.ghostBorder:SetVertexColor(0, 0, 0, 0.9)
+        pip.ghost:SetTexture(fill)
+        pip.ghost:SetVertexColor(c[1], c[2], c[3], 0.9)
         pip.outline:SetStatusBarTexture(border)
         pip.outline:SetStatusBarColor(0, 0, 0, 1)
         pip.fill:SetStatusBarTexture(fill)
@@ -187,16 +196,33 @@ for i = 1, PIP_COUNT do
     timers[i] = { gate = gate, holder = holder, bar = bar, text = text, length = 0 }
 end
 
--- Combo points below the Slice and Dice bar (default) or above it. Only the two rows
--- swap; the frame's overall size and position stay the same, so it doesn't jump.
-local function applyLayout()
+-- Effective pixel metrics at the current width/height multipliers. The base constants are
+-- the size at width = height = 1; the Scale slider (root:SetScale) zooms the whole frame
+-- uniformly on top of this. PIP_GAP scales with its own axis - horizontally between pips,
+-- vertically between the two rows.
+local function metrics()
+    local w = (db and db.width) or 1
+    local h = (db and db.height) or 1
+    return PIP_WIDTH * w, PIP_HEIGHT * h, PIP_GAP * w, PIP_GAP * h, BAR_HEIGHT * h
+end
+
+-- Sizes and positions everything from the current metrics. Combo points sit below the
+-- Slice and Dice bar (default) or above it; either way the frame is re-sized to fit, so
+-- the timer bars (anchored to sndHolder via SetAllPoints) follow automatically.
+local function applySize()
+    local pipW, pipH, gapX, gapY, barH = metrics()
+    local w = PIP_COUNT * pipW + (PIP_COUNT - 1) * gapX
+    root:SetSize(w, pipH + gapY + barH)
+
     local top = db and db.pipsOnTop
-    local pipY = top and 0 or -(BAR_HEIGHT + PIP_GAP)
-    local barY = top and -(PIP_HEIGHT + PIP_GAP) or 0
+    local pipY = top and 0 or -(barH + gapY)
+    local barY = top and -(pipH + gapY) or 0
     for i, pip in ipairs(pips) do
+        pip.holder:SetSize(pipW, pipH)
         pip.holder:ClearAllPoints()
-        pip.holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (PIP_WIDTH + PIP_GAP), pipY)
+        pip.holder:SetPoint("TOPLEFT", root, "TOPLEFT", (i - 1) * (pipW + gapX), pipY)
     end
+    sndHolder:SetSize(w, barH)
     sndHolder:ClearAllPoints()
     sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", 0, barY)
 end
@@ -342,7 +368,10 @@ local function applyLock()
     root:EnableMouse(unlocked)
     overlay:SetShown(unlocked)
     hint:SetShown(unlocked)
-    for _, pip in ipairs(pips) do pip.ghost:SetShown(unlocked) end
+    for _, pip in ipairs(pips) do
+        pip.ghost:SetShown(unlocked)
+        pip.ghostBorder:SetShown(unlocked)
+    end
     refreshSndVisibility()
 end
 
@@ -362,6 +391,7 @@ end)
 -- decode as "pips below", so existing settings carry over. Saved settings stay the
 -- primary store; this only fills the gap.
 local SCALE_MIN, SCALE_MAX, SCALE_STEP = 0.5, 3, 0.05
+local SIZE_MIN, SIZE_MAX, SIZE_STEP = 0.5, 3, 0.05
 local store = CreateFrame("Frame", "CutthroatSettingsStore", UIParent)
 store:SetSize(1, 1)
 store:SetAlpha(0)
@@ -396,7 +426,7 @@ local function readStore()
     applyShape()
     applyScale()
     applyLock()
-    applyLayout()
+    applySize()
 end
 
 -- ---------------------------------------------------------------- events
@@ -430,7 +460,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         end
         if not SHAPE_SET[db.pipShape] then db.pipShape = DEFAULTS.pipShape end
         applyShape()
-        applyLayout()
+        applySize()
         applyPosition()
         applyLock()
         readStore() -- in case the layout cache was applied before us
@@ -479,6 +509,18 @@ local function setScale(scale)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
+local function setWidth(w)
+    db.width = w
+    applySize()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+local function setHeight(h)
+    db.height = h
+    applySize()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
 local function setShape(shape)
     db.pipShape = shape
     applyShape()
@@ -488,15 +530,16 @@ end
 
 local function setPipsOnTop(onTop)
     db.pipsOnTop = onTop
-    applyLayout()
+    applySize()
     writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
 local function resetPosition()
     db.point = { unpack(DEFAULTS.point) }
-    db.scale = 1
+    db.scale, db.width, db.height = 1, 1, 1
     applyPosition()
+    applySize()
     writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
@@ -518,9 +561,44 @@ local function makeButton(parent, label, width, onClick)
     return b
 end
 
+-- A labelled horizontal slider on one row at vertical offset y. apply(value) is called
+-- (from OnValueChanged) with the stepped value whenever the user drags or wheels it;
+-- the label on the left shows labelFmt. refresh() pushes db values back in via SetValue.
+local function makeSlider(parent, y, min, max, step, labelFmt, apply)
+    local label = parent:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    label:SetPoint("TOPLEFT", 14, y)
+    local slider = CreateFrame("Slider", nil, parent)
+    slider:SetOrientation("HORIZONTAL")
+    slider:SetSize(150, 14)
+    slider:SetPoint("TOPRIGHT", -14, y)
+    slider:SetMinMaxValues(min, max)
+    slider:SetValueStep(step)
+    if slider.SetObeyStepOnDrag then slider:SetObeyStepOnDrag(true) end
+    local track = slider:CreateTexture(nil, "BACKGROUND")
+    track:SetPoint("LEFT")
+    track:SetPoint("RIGHT")
+    track:SetHeight(4)
+    track:SetColorTexture(0.25, 0.25, 0.25, 1)
+    slider:SetThumbTexture(WHITE)
+    local thumb = slider:GetThumbTexture()
+    thumb:SetSize(10, 14)
+    thumb:SetVertexColor(1.00, 0.82, 0.10)
+    slider:EnableMouseWheel(true)
+    slider:SetScript("OnMouseWheel", function(self, delta)
+        self:SetValue(self:GetValue() + delta * step)
+    end)
+    slider:SetScript("OnValueChanged", function(_, value)
+        value = math.floor(value / step + 0.5) * step
+        label:SetFormattedText(labelFmt, value)
+        if db then apply(value) end
+    end)
+    slider.label = label
+    return slider
+end
+
 local function buildPanel()
     local p = CreateFrame("Frame", "CutthroatOptions", UIParent)
-    p:SetSize(280, 266)
+    p:SetSize(280, 340)
     p:SetPoint("CENTER")
     p:SetFrameStrata("DIALOG")
     p:SetClampedToScreen(true)
@@ -559,48 +637,26 @@ local function buildPanel()
     local lockButton = makeButton(p, "", 150, function() setLocked(not db.locked) end)
     lockButton:SetPoint("TOPRIGHT", -14, -40)
 
-    -- scale slider
-    local scaleLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    scaleLabel:SetPoint("TOPLEFT", 14, -82)
-    local slider = CreateFrame("Slider", nil, p)
-    slider:SetOrientation("HORIZONTAL")
-    slider:SetSize(150, 14)
-    slider:SetPoint("TOPRIGHT", -14, -82)
-    slider:SetMinMaxValues(SCALE_MIN, SCALE_MAX)
-    slider:SetValueStep(SCALE_STEP)
-    if slider.SetObeyStepOnDrag then slider:SetObeyStepOnDrag(true) end
-    local track = slider:CreateTexture(nil, "BACKGROUND")
-    track:SetPoint("LEFT")
-    track:SetPoint("RIGHT")
-    track:SetHeight(4)
-    track:SetColorTexture(0.25, 0.25, 0.25, 1)
-    slider:SetThumbTexture(WHITE)
-    local thumb = slider:GetThumbTexture()
-    thumb:SetSize(10, 14)
-    thumb:SetVertexColor(1.00, 0.82, 0.10)
-    slider:EnableMouseWheel(true)
-    slider:SetScript("OnMouseWheel", function(self, delta)
-        self:SetValue(self:GetValue() + delta * SCALE_STEP)
+    -- size sliders: overall Scale (uniform zoom), plus independent Width and Height stretch
+    local scaleSlider = makeSlider(p, -82, SCALE_MIN, SCALE_MAX, SCALE_STEP, "Scale  %.2f", function(v)
+        if math.abs(v - db.scale) > 0.001 then db.scale = v; applyScale(); writeStore() end
     end)
-    slider:SetScript("OnValueChanged", function(_, value)
-        value = math.floor(value / SCALE_STEP + 0.5) * SCALE_STEP
-        scaleLabel:SetFormattedText("Scale  %.2f", value)
-        if db and math.abs(value - db.scale) > 0.001 then
-            db.scale = value
-            applyScale()
-            writeStore()
-        end
+    local widthSlider = makeSlider(p, -118, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Width  %.2f", function(v)
+        if math.abs(v - db.width) > 0.001 then db.width = v; applySize() end
+    end)
+    local heightSlider = makeSlider(p, -154, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Height  %.2f", function(v)
+        if math.abs(v - db.height) > 0.001 then db.height = v; applySize() end
     end)
 
     -- pip shape: one icon button per shape
     local shapeLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    shapeLabel:SetPoint("TOPLEFT", 14, -118)
+    shapeLabel:SetPoint("TOPLEFT", 14, -190)
     shapeLabel:SetText("Pip shape")
     local shapeButtons = {}
     for idx, shape in ipairs(SHAPES) do
         local b = CreateFrame("Button", nil, p)
         b:SetSize(24, 24)
-        b:SetPoint("TOPRIGHT", -14 - (#SHAPES - idx) * 30, -112)
+        b:SetPoint("TOPRIGHT", -14 - (#SHAPES - idx) * 30, -184)
         local selected = b:CreateTexture(nil, "BACKGROUND")
         selected:SetPoint("TOPLEFT", -3, 3)
         selected:SetPoint("BOTTOMRIGHT", 3, -3)
@@ -630,31 +686,35 @@ local function buildPanel()
 
     -- combo points above or below the Slice and Dice bar
     local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    layoutLabel:SetPoint("TOPLEFT", 14, -156)
+    layoutLabel:SetPoint("TOPLEFT", 14, -228)
     layoutLabel:SetText("Combo points")
     local layoutButton = makeButton(p, "", 150, function() setPipsOnTop(not db.pipsOnTop) end)
-    layoutButton:SetPoint("TOPRIGHT", -14, -152)
+    layoutButton:SetPoint("TOPRIGHT", -14, -224)
 
     -- reset
-    local resetButton = makeButton(p, "Reset position and scale", 252, resetPosition)
-    resetButton:SetPoint("TOPLEFT", 14, -188)
+    local resetButton = makeButton(p, "Reset size and position", 252, resetPosition)
+    resetButton:SetPoint("TOPLEFT", 14, -260)
 
     -- read-only info
     local info = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    info:SetPoint("TOPLEFT", 14, -222)
+    info:SetPoint("TOPLEFT", 14, -294)
     info:SetPoint("RIGHT", -14, 0)
     info:SetJustifyH("LEFT")
 
     function p.refresh()
         lockButton.text:SetText(db.locked and "Locked" or "Unlocked (drag the bar)")
-        slider:SetValue(db.scale)
-        scaleLabel:SetFormattedText("Scale  %.2f", db.scale)
+        scaleSlider:SetValue(db.scale)
+        scaleSlider.label:SetFormattedText("Scale  %.2f", db.scale)
+        widthSlider:SetValue(db.width)
+        widthSlider.label:SetFormattedText("Width  %.2f", db.width)
+        heightSlider:SetValue(db.height)
+        heightSlider.label:SetFormattedText("Height  %.2f", db.height)
         for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
         layoutButton.text:SetText(db.pipsOnTop and "Above the bar" or "Below the bar")
         if math.abs(db.sndMult - 1) < 0.001 then
             info:SetText("Slice and Dice talent bonus: not learned yet\n(learned after your first Slice and Dice out of combat)")
         else
-            info:SetFormattedText("Slice and Dice talent bonus: +%d%% (learned)\nCommands: /cut lock | unlock | reset | scale <n>",
+            info:SetFormattedText("Slice and Dice talent bonus: +%d%% (learned)\nCommands: /cut lock | reset | scale | width | height <n>",
                 math.floor((db.sndMult - 1) * 100 + 0.5))
         end
     end
@@ -676,7 +736,7 @@ SlashCmdList.CUTTHROAT = function(msg)
         local ok, err = pcall(togglePanel)
         if not ok then
             print(PREFIX .. "settings panel failed to open: " .. tostring(err))
-            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | pips above|below")
+            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | width <n> | height <n> | pips above|below")
         end
     elseif cmd == "lock" then
         setLocked(true)
@@ -712,7 +772,23 @@ SlashCmdList.CUTTHROAT = function(msg)
         else
             print(PREFIX .. "usage: /cut scale 0.5-3  (e.g. /cut scale 1.5)")
         end
+    elseif cmd == "width" then
+        local n = tonumber(arg)
+        if n and n >= SIZE_MIN and n <= SIZE_MAX then
+            setWidth(n)
+            print(PREFIX .. "width " .. n)
+        else
+            print(PREFIX .. "usage: /cut width 0.5-3  (e.g. /cut width 1.5)")
+        end
+    elseif cmd == "height" then
+        local n = tonumber(arg)
+        if n and n >= SIZE_MIN and n <= SIZE_MAX then
+            setHeight(n)
+            print(PREFIX .. "height " .. n)
+        else
+            print(PREFIX .. "usage: /cut height 0.5-3  (e.g. /cut height 1.5)")
+        end
     else
-        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale <0.5-3> | shape <name> | pips above|below")
+        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale | width | height <0.5-3> | shape <name> | pips above|below")
     end
 end
