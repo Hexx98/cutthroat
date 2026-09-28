@@ -31,7 +31,7 @@ local PIP_COLORS = {
 }
 local DEFAULTS = {
     locked = false, scale = 1, barWidth = 1, barHeight = 1, pipSize = 1,
-    sndMult = 1, pipShape = "square", pipsOnTop = false,
+    sndMult = 1, pipShape = "square", pipsOnTop = false, showPips = true,
     point = { "CENTER", "CENTER", 0, -180 },
 }
 -- media\<shape>.tga is the fill; media\<shape>_border.tga is the same shape grown for the outline
@@ -231,6 +231,18 @@ end
 -- the timer bars (anchored to sndHolder via SetAllPoints) follow automatically.
 local function applySize()
     local pipW, pipH, gapX, gapY, barH, frameW, barW, pipRowW = metrics()
+
+    -- Pips off: the frame is just the bar. Hiding the holders takes their ghosts and gated
+    -- bars with them, so nothing else needs to know.
+    if db and not db.showPips then
+        for _, pip in ipairs(pips) do pip.holder:Hide() end
+        root:SetSize(barW, barH)
+        sndHolder:SetSize(barW, barH)
+        sndHolder:ClearAllPoints()
+        sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", 0, 0)
+        return
+    end
+    for _, pip in ipairs(pips) do pip.holder:Show() end
     root:SetSize(frameW, pipH + gapY + barH)
 
     local top = db and db.pipsOnTop
@@ -432,7 +444,8 @@ local function writeStore()
     end
     store:ClearAllPoints()
     store:SetPoint("CENTER", UIParent, "CENTER",
-        100 + shapeIndex + (db.locked and 20 or 0) + (db.pipsOnTop and 40 or 0),
+        100 + shapeIndex + (db.locked and 20 or 0) + (db.pipsOnTop and 40 or 0)
+            + (db.showPips and 0 or 80),
         math.floor(db.scale * 100 + 0.5))
     store:SetUserPlaced(true)
 end
@@ -444,9 +457,12 @@ local function readStore()
     if not (x and y) then return end
     x, y = math.floor(x + 0.5), math.floor(y + 0.5)
 
-    local index, locked, onTop
-    if x >= 100 then                      -- current layout: 100 + index (+20 locked, +40 above)
+    -- unpack largest flag first: 100 + index (+20 locked, +40 above, +80 pips hidden)
+    local index, locked, onTop, showPips
+    if x >= 100 then
         local rest = x - 100
+        showPips = not (rest > 80)
+        if not showPips then rest = rest - 80 end
         onTop = rest > 40
         if onTop then rest = rest - 40 end
         locked = rest > 20
@@ -459,7 +475,7 @@ local function readStore()
         locked = rest > 10
         if locked then rest = rest - 10 end
         if rest > 5 then return end       -- only five shapes existed back then
-        index = rest
+        index, showPips = rest, true
     else
         return
     end
@@ -467,7 +483,8 @@ local function readStore()
     local shape, scale = SHAPES[index], y / 100
     if not shape or scale < SCALE_MIN or scale > SCALE_MAX then return end
     storeRead = true
-    db.pipShape, db.locked, db.scale, db.pipsOnTop = shape, locked, scale, onTop
+    db.pipShape, db.locked, db.scale, db.pipsOnTop, db.showPips =
+        shape, locked, scale, onTop, showPips
     applyShape()
     applyScale()
     applyLock()
@@ -585,8 +602,32 @@ local function setShape(shape)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
+local function setShowPips(show)
+    db.showPips = show
+    applySize()
+    applyLock()
+    writeStore()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+-- the Placement control cycles: below -> above -> hidden -> below
+local function cyclePipDisplay()
+    if not db.showPips then
+        db.showPips, db.pipsOnTop = true, false
+    elseif db.pipsOnTop then
+        db.showPips = false
+    else
+        db.pipsOnTop = true
+    end
+    applySize()
+    applyLock()
+    writeStore()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
 local function setPipsOnTop(onTop)
     db.pipsOnTop = onTop
+    db.showPips = true          -- asking for a placement implies you want them visible
     applySize()
     writeStore()
     if panel and panel:IsShown() then panel.refresh() end
@@ -811,7 +852,7 @@ local function buildPanel()
     local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     layoutLabel:SetPoint("TOPLEFT", IN, -272)
     layoutLabel:SetText("Placement")
-    local layoutButton = makeButton(p, "", 142, function() setPipsOnTop(not db.pipsOnTop) end)
+    local layoutButton = makeButton(p, "", 142, cyclePipDisplay)
     layoutButton:SetPoint("TOPRIGHT", -IN, -268)
 
     -- reset
@@ -835,7 +876,17 @@ local function buildPanel()
         pipSizeSlider:SetValue(db.pipSize)
         pipSizeSlider.label:SetFormattedText("Pip size  %.2f", db.pipSize)
         for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
-        layoutButton.text:SetText(db.pipsOnTop and "Above the bar" or "Below the bar")
+        layoutButton.text:SetText(not db.showPips and "Hidden"
+            or (db.pipsOnTop and "Above the bar" or "Below the bar"))
+        -- pip size and shape do nothing while the pips are hidden, so dim them out
+        local lit = db.showPips and 1 or 0.3
+        pipSizeSlider:SetAlpha(lit)
+        pipSizeSlider:EnableMouse(db.showPips)
+        shapeLabel:SetAlpha(lit)
+        for _, b in pairs(shapeButtons) do
+            b:SetAlpha(lit)
+            b:EnableMouse(db.showPips)
+        end
         if math.abs(db.sndMult - 1) < 0.001 then
             info:SetText("Slice and Dice talent bonus: not learned yet\n(learned after your first Slice and Dice out of combat)")
         else
@@ -861,7 +912,7 @@ SlashCmdList.CUTTHROAT = function(msg)
         local ok, err = pcall(togglePanel)
         if not ok then
             print(PREFIX .. "settings panel failed to open: " .. tostring(err))
-            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | barwidth <n> | barheight <n> | pipsize <n> | pips above|below")
+            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | barwidth <n> | barheight <n> | pipsize <n> | pips above|below|show|hide")
         end
     elseif cmd == "lock" then
         setLocked(true)
@@ -886,8 +937,14 @@ SlashCmdList.CUTTHROAT = function(msg)
         elseif arg == "below" or arg == "bottom" then
             setPipsOnTop(false)
             print(PREFIX .. "combo points below the Slice and Dice bar.")
+        elseif arg == "hide" or arg == "off" then
+            setShowPips(false)
+            print(PREFIX .. "combo points hidden - just the Slice and Dice bar now.")
+        elseif arg == "show" or arg == "on" then
+            setShowPips(true)
+            print(PREFIX .. "combo points shown.")
         else
-            print(PREFIX .. "usage: /cut pips above | below")
+            print(PREFIX .. "usage: /cut pips above | below | show | hide")
         end
     elseif cmd == "scale" then
         local n = tonumber(arg)
@@ -922,6 +979,6 @@ SlashCmdList.CUTTHROAT = function(msg)
             print(PREFIX .. "usage: /cut pipsize 0.5-3  (e.g. /cut pipsize 1.5)")
         end
     else
-        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale | barwidth | barheight | pipsize <0.5-3> | shape <name> | pips above|below")
+        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale | barwidth | barheight | pipsize <0.5-3> | shape <name> | pips above|below|show|hide")
     end
 end
