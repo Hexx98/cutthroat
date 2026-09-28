@@ -4,24 +4,23 @@
 --  * Combo points are secret: addons may display them but not read, compare, or do math on
 --    them. Each pip is a StatusBar ranged [i-1, i] handed the raw count; the engine clamps
 --    it, lighting pips 1..cp without this code ever looking at the number.
---  * Buffs cannot be read at all in combat. So the Slice and Dice timer is built from the
---    cast: the cast events still report the spell ID, so on each cast we start five
---    countdowns, one per possible combo point count. Five invisible "gate" bars get the
---    secret combo point count (the pip trick again) and each countdown is clipped to its
---    gate's fill, so countdowns 1..cp are visible and the right one, cp, is on top.
---  * Out of combat buffs are readable, so the timer re-syncs to the real buff there and
---    learns the Improved Slice and Dice talent multiplier from it.
+--  * Buffs cannot be read at all in combat. So a timer bar is built from the cast instead:
+--    the cast events still report the spell ID, so on each cast a combo-point-scaled bar
+--    starts five countdowns, one per possible combo point count. Five invisible "gate" bars
+--    get the secret count (the pip trick again) and each countdown is clipped to its gate's
+--    fill, so countdowns 1..cp are visible and the right one, cp, is on top.
+--  * Out of combat auras are readable, so a bar re-syncs to the real one there and learns
+--    its talent multiplier from it.
+--
+-- Bars are data, not code: see BAR_DEFS. Slice and Dice is the only one so far.
 
 local ADDON_NAME = ...
 
-local SND_SPELL_IDS = { [5171] = true, [6774] = true } -- ranks 1 and 2
-local SND_BASE_SECONDS = { 9, 12, 15, 18, 21 }          -- per combo point, before talents
 local PIP_COUNT = 5
 local PIP_WIDTH, PIP_HEIGHT, PIP_GAP = 22, 22, 4
 local BAR_HEIGHT = 20
 -- the frame's width at barWidth = 1: five pips at their natural spacing
 local BASE_WIDTH = PIP_COUNT * PIP_WIDTH + (PIP_COUNT - 1) * PIP_GAP
-local SND_COLOR = { 0.35, 0.80, 0.25 }
 local WARN_SECONDS = 5       -- bar turns red and pulses below this
 local WARN_PULSE_HZ = 2.5
 local WHITE = "Interface\\Buttons\\WHITE8X8"
@@ -29,6 +28,26 @@ local PIP_COLORS = {
     { 1.00, 0.82, 0.10 }, { 1.00, 0.82, 0.10 }, { 1.00, 0.82, 0.10 },
     { 1.00, 0.55, 0.10 }, { 1.00, 0.25, 0.10 },
 }
+-- Every timer bar is described here and built by createBar(), so adding one is a new entry
+-- rather than another copy of the machinery.
+--   seconds  a table = the duration scales with combo points, so the bar runs all five
+--            countdowns at once and lets the engine pick (see createBar);
+--            a number = a fixed duration, which needs one countdown and no gates.
+--   unit     which unit carries the aura - "player" for a buff on us. Debuffs on "target"
+--            will also need per-target tracking, which does not exist yet.
+--   multKey  db field holding the talent multiplier learned from the real buff.
+local BAR_DEFS = {
+    {
+        key      = "snd",
+        label    = "Slice and Dice",
+        spellIDs = { [5171] = true, [6774] = true },   -- ranks 1 and 2
+        seconds  = { 9, 12, 15, 18, 21 },              -- per combo point, before talents
+        color    = { 0.35, 0.80, 0.25 },
+        unit     = "player",
+        multKey  = "sndMult",
+    },
+}
+
 local DEFAULTS = {
     locked = false, scale = 1, barWidth = 1, barHeight = 1, pipSize = 1,
     sndMult = 1, pipShape = "square", pipsOnTop = false, showPips = true,
@@ -162,45 +181,71 @@ local function applyShape()
 end
 applyShape()
 
--- Slice and Dice area: an idle placeholder plus five gated countdowns stacked on top
-local sndHolder = CreateFrame("Frame", nil, root)
-sndHolder:SetSize(width, BAR_HEIGHT)
-sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", 0, 0)
-local sndBackdrop = sndHolder:CreateTexture(nil, "BACKGROUND")
-sndBackdrop:SetAllPoints()
-sndBackdrop:SetColorTexture(0, 0, 0, 0.6)
-local placeholder = sndHolder:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-placeholder:SetPoint("CENTER")
-placeholder:SetText("Slice and Dice")
-placeholder:SetAlpha(0.5)
+-- One timer bar: an idle placeholder plus its countdowns.
+--
+-- A combo-point-scaled bar cannot know which duration applies, because the count is secret.
+-- So it builds five countdowns and lets the engine choose: five invisible gate bars ranged
+-- [i-1, i] are handed the secret count, and each countdown is clipped to its gate's fill, so
+-- countdowns 1..cp are visible and the right one, cp, draws on top. A fixed-duration bar
+-- needs none of that - one countdown, no gates.
+local function createBar(def)
+    local bar = { def = def, start = nil, timers = {} }
 
-local timers = {}
-local baseLevel = sndHolder:GetFrameLevel()
-for i = 1, PIP_COUNT do
-    -- invisible gate: full when combo points >= i, empty otherwise
-    local gate = CreateFrame("StatusBar", nil, sndHolder)
-    gate:SetAllPoints()
-    gate:SetStatusBarTexture(WHITE)
-    gate:SetMinMaxValues(i - 1, i)
-    gate:SetValue(0)
-    gate:SetAlpha(0)
+    local frame = CreateFrame("Frame", nil, root)
+    frame:SetSize(width, BAR_HEIGHT)
+    frame:SetPoint("TOPLEFT", root, "TOPLEFT", 0, 0)
+    bar.frame = frame
 
-    -- window sized to the gate's fill; clips the countdown inside it
-    local fill = gate:GetStatusBarTexture()
-    local window = CreateFrame("Frame", nil, sndHolder)
-    window:SetClipsChildren(true)
-    window:SetFrameLevel(baseLevel + 5 * i) -- higher combo points draw on top
-    window:SetPoint("TOPLEFT", fill, "TOPLEFT")
-    window:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT")
+    local backdrop = frame:CreateTexture(nil, "BACKGROUND")
+    backdrop:SetAllPoints()
+    backdrop:SetColorTexture(0, 0, 0, 0.6)
 
-    local holder, bar = makeBar(window, width, BAR_HEIGHT)
-    holder:SetAllPoints(sndHolder)
-    bar:SetStatusBarColor(unpack(SND_COLOR))
-    local text = bar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    text:SetPoint("CENTER")
-    holder:Hide()
+    local placeholder = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    placeholder:SetPoint("CENTER")
+    placeholder:SetText(def.label)
+    placeholder:SetAlpha(0.5)
+    bar.placeholder = placeholder
 
-    timers[i] = { gate = gate, holder = holder, bar = bar, text = text, length = 0 }
+    local gated = type(def.seconds) == "table"
+    local baseLevel = frame:GetFrameLevel()
+    for i = 1, gated and PIP_COUNT or 1 do
+        local parent, gate = frame, nil
+        if gated then
+            -- invisible gate: full when combo points >= i, empty otherwise
+            gate = CreateFrame("StatusBar", nil, frame)
+            gate:SetAllPoints()
+            gate:SetStatusBarTexture(WHITE)
+            gate:SetMinMaxValues(i - 1, i)
+            gate:SetValue(0)
+            gate:SetAlpha(0)
+
+            -- window sized to the gate's fill; clips the countdown inside it
+            local fill = gate:GetStatusBarTexture()
+            local window = CreateFrame("Frame", nil, frame)
+            window:SetClipsChildren(true)
+            window:SetFrameLevel(baseLevel + 5 * i) -- higher combo points draw on top
+            window:SetPoint("TOPLEFT", fill, "TOPLEFT")
+            window:SetPoint("BOTTOMRIGHT", fill, "BOTTOMRIGHT")
+            parent = window
+        end
+
+        local holder, statusBar = makeBar(parent, width, BAR_HEIGHT)
+        holder:SetAllPoints(frame)
+        statusBar:SetStatusBarColor(unpack(def.color))
+        local text = statusBar:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        text:SetPoint("CENTER")
+        holder:Hide()
+
+        bar.timers[i] = { gate = gate, holder = holder, bar = statusBar, text = text, length = 0 }
+    end
+    return bar
+end
+
+local bars, barsByKey = {}, {}
+for _, def in ipairs(BAR_DEFS) do
+    local bar = createBar(def)
+    bars[#bars + 1] = bar
+    barsByKey[def.key] = bar
 end
 
 -- Effective pixel metrics. The base constants are the size at every multiplier = 1, and the
@@ -226,9 +271,20 @@ local function metrics()
     return pipW, pipH, gapX, PIP_GAP, BAR_HEIGHT * barHm, math.max(barW, pipRowW), barW, pipRowW
 end
 
+-- Places every bar in the bar area. Only one bar exists today, so this is a single frame at
+-- the given spot; stacking / side-by-side arrives with the container work.
+local function layoutBars(barW, barH, x, y)
+    for _, bar in ipairs(bars) do
+        bar.frame:SetSize(barW, barH)
+        bar.frame:ClearAllPoints()
+        bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", x, y)
+        y = y - barH
+    end
+end
+
 -- Sizes and positions everything from the current metrics. Combo points sit below the
 -- Slice and Dice bar (default) or above it; either way the frame is re-sized to fit, so
--- the timer bars (anchored to sndHolder via SetAllPoints) follow automatically.
+-- each bar's countdowns (anchored to its frame via SetAllPoints) follow automatically.
 local function applySize()
     local pipW, pipH, gapX, gapY, barH, frameW, barW, pipRowW = metrics()
 
@@ -237,9 +293,7 @@ local function applySize()
     if db and not db.showPips then
         for _, pip in ipairs(pips) do pip.holder:Hide() end
         root:SetSize(barW, barH)
-        sndHolder:SetSize(barW, barH)
-        sndHolder:ClearAllPoints()
-        sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", 0, 0)
+        layoutBars(barW, barH, 0, 0)
         return
     end
     for _, pip in ipairs(pips) do pip.holder:Show() end
@@ -257,9 +311,7 @@ local function applySize()
         pip.holder:ClearAllPoints()
         pip.holder:SetPoint("TOPLEFT", root, "TOPLEFT", pipX + (i - 1) * (pipW + gapX), pipY)
     end
-    sndHolder:SetSize(barW, barH)
-    sndHolder:ClearAllPoints()
-    sndHolder:SetPoint("TOPLEFT", root, "TOPLEFT", barX, barY)
+    layoutBars(barW, barH, barX, barY)
 end
 
 -- ---------------------------------------------------------------- combo points
@@ -274,114 +326,147 @@ local function updateComboPoints()
 end
 
 -- ---------------------------------------------------------------- slice and dice
-local sndStart  -- GetTime() the current countdowns started; nil when idle
 local pendingCP -- secret combo point count captured as the cast is sent
 
-local function refreshSndVisibility()
-    local idle = not sndStart
-    placeholder:SetShown(idle)
-    sndHolder:SetShown(not idle or (db ~= nil and not db.locked))
+local function barRefreshVisibility(bar)
+    local idle = not bar.start
+    bar.placeholder:SetShown(idle)
+    bar.frame:SetShown(not idle or (db ~= nil and not db.locked))
 end
 
-local function stopTimers()
-    sndStart = nil
-    for _, t in ipairs(timers) do t.holder:Hide() end
-    refreshSndVisibility()
+local function refreshBarVisibility()
+    for _, bar in ipairs(bars) do barRefreshVisibility(bar) end
 end
 
--- lengths: seconds per countdown. open: value for the gates - the secret combo point
--- count after a cast, or PIP_COUNT to open all of them when the real buff is known.
-local function startTimers(start, lengths, open)
-    sndStart = start
-    for i, t in ipairs(timers) do
+local function barStop(bar)
+    bar.start = nil
+    for _, t in ipairs(bar.timers) do t.holder:Hide() end
+    barRefreshVisibility(bar)
+end
+
+-- lengths: seconds per countdown. open: value for the gates - the secret combo point count
+-- after a cast, or PIP_COUNT to open all of them when the real aura is known. A fixed
+-- duration bar has no gates, so open is ignored.
+local function barStart(bar, start, lengths, open)
+    bar.start = start
+    for i, t in ipairs(bar.timers) do
         t.length = lengths[i]
-        t.gate:SetValue(open)
+        if t.gate then t.gate:SetValue(open) end
         t.bar:SetMinMaxValues(0, t.length)
         t.holder:Show()
     end
-    refreshSndVisibility()
+    barRefreshVisibility(bar)
 end
 
-local sinceUpdate = 0
-sndHolder:SetScript("OnUpdate", guard("OnUpdate", function(_, elapsed)
-    if not sndStart then return end
-    sinceUpdate = sinceUpdate + elapsed
-    if sinceUpdate < 0.05 then return end
-    sinceUpdate = 0
-    local now, running = GetTime(), false
-    for _, t in ipairs(timers) do
+-- returns true while any countdown on this bar is still running
+local function barUpdate(bar, now)
+    local running = false
+    for _, t in ipairs(bar.timers) do
         if t.holder:IsShown() then
-            local remaining = sndStart + t.length - now
+            local remaining = bar.start + t.length - now
             if remaining <= 0 then
                 t.holder:Hide()
             else
                 running = true
                 t.bar:SetValue(remaining)
-                t.text:SetFormattedText("Slice and Dice  %.1f", remaining)
+                t.text:SetFormattedText("%s  %.1f", bar.def.label, remaining)
                 if remaining <= WARN_SECONDS then
                     -- pulse between bright and dark red; color, not alpha, so the
                     -- stacked countdowns underneath never show through
                     local k = 0.5 + 0.5 * math.sin(now * 2 * math.pi * WARN_PULSE_HZ)
                     t.bar:SetStatusBarColor(0.45 + 0.55 * k, 0.05 + 0.10 * k, 0.05 + 0.05 * k)
                 else
-                    t.bar:SetStatusBarColor(unpack(SND_COLOR))
+                    t.bar:SetStatusBarColor(unpack(bar.def.color))
                 end
             end
         end
     end
-    if not running then stopTimers() end
+    return running
+end
+
+-- Driven from the root frame rather than any one bar, so it keeps running no matter which
+-- bars are hidden.
+local sinceUpdate = 0
+root:SetScript("OnUpdate", guard("OnUpdate", function(_, elapsed)
+    sinceUpdate = sinceUpdate + elapsed
+    if sinceUpdate < 0.05 then return end
+    sinceUpdate = 0
+    local now = GetTime()
+    for _, bar in ipairs(bars) do
+        if bar.start and not barUpdate(bar, now) then barStop(bar) end
+    end
 end))
 
-local function isSliceAndDiceCast(spellID)
-    return isReadable(spellID) and SND_SPELL_IDS[spellID] or false
+local function barForSpell(spellID)
+    if not isReadable(spellID) then return nil end
+    for _, bar in ipairs(bars) do
+        if bar.def.spellIDs[spellID] then return bar end
+    end
+end
+
+-- seconds per countdown for a fresh cast, talent multiplier applied
+local function castLengths(bar)
+    local def = bar.def
+    if type(def.seconds) == "number" then return { def.seconds } end
+    local mult = (def.multKey and db[def.multKey]) or 1
+    local lengths = {}
+    for i = 1, PIP_COUNT do lengths[i] = def.seconds[i] * mult end
+    return lengths
 end
 
 local function onCastSent(spellID)
-    if isSliceAndDiceCast(spellID) then
+    if barForSpell(spellID) then
         pendingCP = GetComboPoints("player", "target")
     end
 end
 
 local function onCastSucceeded(spellID)
-    if not isSliceAndDiceCast(spellID) then return end
+    local bar = barForSpell(spellID)
+    if not bar then return end
     local cp = pendingCP or GetComboPoints("player", "target") or 0
     pendingCP = nil
-    local lengths = {}
-    for i = 1, PIP_COUNT do lengths[i] = SND_BASE_SECONDS[i] * db.sndMult end
-    startTimers(GetTime(), lengths, cp)
+    barStart(bar, GetTime(), castLengths(bar), cp)
 end
 
 -- Only callable while auras are readable (out of combat); throws otherwise.
-local function findSliceAndDice()
+local function findAura(bar)
     for i = 1, 40 do
-        local aura = C_UnitAuras.GetBuffDataByIndex("player", i)
+        local aura = C_UnitAuras.GetBuffDataByIndex(bar.def.unit, i)
         if not aura then return nil end
         local id = aura.spellId
-        if isReadable(id) and SND_SPELL_IDS[id] then return aura end
+        if isReadable(id) and bar.def.spellIDs[id] then return aura end
     end
 end
 
--- Replace the cast-based estimate with the real buff whenever the client lets us see it.
-local function syncFromBuff()
-    if aurasHidden() then return end
-    local ok, aura = pcall(findSliceAndDice)
+local function syncBar(bar)
+    local ok, aura = pcall(findAura, bar)
     if not ok then return end
     if not aura then
-        if sndStart then stopTimers() end
+        if bar.start then barStop(bar) end
         return
     end
     local exp, dur = aura.expirationTime, aura.duration
     if not (isReadable(exp) and isReadable(dur)) or dur <= 0 then return end
 
-    -- learn the talent multiplier from the buff's full (5 combo point) duration
-    local okB, base = pcall(C_UnitAuras.GetAuraBaseDuration, "player", aura.auraInstanceID)
-    if okB and isReadable(base) and base > 0 then
-        db.sndMult = base / SND_BASE_SECONDS[PIP_COUNT]
+    local def = bar.def
+    -- learn the talent multiplier from the aura's full (5 combo point) duration
+    if def.multKey and type(def.seconds) == "table" then
+        local okB, base = pcall(C_UnitAuras.GetAuraBaseDuration, def.unit, aura.auraInstanceID)
+        if okB and isReadable(base) and base > 0 then
+            db[def.multKey] = base / def.seconds[PIP_COUNT]
+        end
     end
 
+    -- the real duration is known, so every countdown gets it and every gate is opened
     local lengths = {}
-    for i = 1, PIP_COUNT do lengths[i] = dur end
-    startTimers(exp - dur, lengths, PIP_COUNT)
+    for i = 1, #bar.timers do lengths[i] = dur end
+    barStart(bar, exp - dur, lengths, PIP_COUNT)
+end
+
+-- Replace the cast-based estimate with the real aura whenever the client lets us see it.
+local function syncFromBuff()
+    if aurasHidden() then return end
+    for _, bar in ipairs(bars) do syncBar(bar) end
 end
 
 -- ---------------------------------------------------------------- position and lock
@@ -407,7 +492,7 @@ local function applyLock()
         pip.ghost:SetShown(unlocked)
         pip.ghostBorder:SetShown(unlocked)
     end
-    refreshSndVisibility()
+    refreshBarVisibility()
 end
 
 root:SetScript("OnDragStart", function(self) self:StartMoving() end)
@@ -610,21 +695,6 @@ local function setShowPips(show)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
--- the Placement control cycles: below -> above -> hidden -> below
-local function cyclePipDisplay()
-    if not db.showPips then
-        db.showPips, db.pipsOnTop = true, false
-    elseif db.pipsOnTop then
-        db.showPips = false
-    else
-        db.pipsOnTop = true
-    end
-    applySize()
-    applyLock()
-    writeStore()
-    if panel and panel:IsShown() then panel.refresh() end
-end
-
 local function setPipsOnTop(onTop)
     db.pipsOnTop = onTop
     db.showPips = true          -- asking for a placement implies you want them visible
@@ -642,9 +712,9 @@ local function resetPosition()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
-local function makeButton(parent, label, width, onClick)
+local function makeButton(parent, label, width, onClick, height)
     local b = CreateFrame("Button", nil, parent)
-    b:SetSize(width, 22)
+    b:SetSize(width, height or 22)
     local bg = b:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
     bg:SetColorTexture(0.18, 0.18, 0.18, 1)
@@ -804,6 +874,11 @@ local function buildPanel()
 
     -- ---- Combo points ----
     sectionHeader(p, -216, "COMBO POINTS")
+    -- Pip visibility. It was folded into Placement at first and nobody could find it, so it
+    -- gets its own control - parked in the empty space beside the bottom row of shape
+    -- buttons (the grid ends at x=194, the content edge is 260), which costs no extra height.
+    local showButton = makeButton(p, "", 58, function() setShowPips(not db.showPips) end)
+    showButton:SetPoint("TOPRIGHT", -IN, -343)
     sectionBox(p, -230, -374)
     local pipSizeSlider = makeSlider(p, -238, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Pip size  %.2f", function(v)
         if math.abs(v - db.pipSize) > 0.001 then db.pipSize = v; applySize() end
@@ -852,7 +927,7 @@ local function buildPanel()
     local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     layoutLabel:SetPoint("TOPLEFT", IN, -272)
     layoutLabel:SetText("Placement")
-    local layoutButton = makeButton(p, "", 142, cyclePipDisplay)
+    local layoutButton = makeButton(p, "", 142, function() setPipsOnTop(not db.pipsOnTop) end)
     layoutButton:SetPoint("TOPRIGHT", -IN, -268)
 
     -- reset
@@ -876,12 +951,15 @@ local function buildPanel()
         pipSizeSlider:SetValue(db.pipSize)
         pipSizeSlider.label:SetFormattedText("Pip size  %.2f", db.pipSize)
         for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
-        layoutButton.text:SetText(not db.showPips and "Hidden"
-            or (db.pipsOnTop and "Above the bar" or "Below the bar"))
-        -- pip size and shape do nothing while the pips are hidden, so dim them out
+        -- standalone button with no label beside it, so it names the action rather than the
+        -- state: "Hide" while the pips are showing, "Show" while they are hidden
+        showButton.text:SetText(db.showPips and "Hide" or "Show")
+        layoutButton.text:SetText(db.pipsOnTop and "Above the bar" or "Below the bar")
+        -- nothing else in this section does anything while the pips are hidden
         local lit = db.showPips and 1 or 0.3
-        pipSizeSlider:SetAlpha(lit)
-        pipSizeSlider:EnableMouse(db.showPips)
+        pipSizeSlider:SetAlpha(lit);  pipSizeSlider:EnableMouse(db.showPips)
+        layoutButton:SetAlpha(lit);   layoutButton:EnableMouse(db.showPips)
+        layoutLabel:SetAlpha(lit)
         shapeLabel:SetAlpha(lit)
         for _, b in pairs(shapeButtons) do
             b:SetAlpha(lit)
