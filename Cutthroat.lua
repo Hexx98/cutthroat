@@ -59,6 +59,18 @@ local BAR_DEFS = {
         perTarget = true,      -- one countdown per target GUID
         learnKey  = "exposeSeconds",
     },
+    {
+        -- both combo-point-scaled and per-target: the gate trick and GUID tracking together
+        key       = "rupture",
+        label     = "Rupture",
+        spellIDs  = { [1943] = true, [8639] = true, [8640] = true,   -- ranks 1-6
+                      [11273] = true, [11274] = true, [11275] = true },
+        seconds   = { 8, 10, 12, 14, 16 },   -- 6 + 2 per combo point
+        color     = { 0.72, 0.33, 0.72 },    -- not red: the expiry warning pulses red
+        unit      = "target",
+        harmful   = true,
+        perTarget = true,
+    },
 }
 
 local DEFAULTS = {
@@ -272,32 +284,97 @@ end
 -- proportional. Widening the bar does NOT push the pips apart - the narrower of the two
 -- rows is simply centred against the wider one, and the frame is as wide as the wider row.
 local function metrics()
-    local barWm = (db and db.barWidth)  or 1
-    local barHm = (db and db.barHeight) or 1
-    local pipS  = (db and db.pipSize)   or 1
-
+    local pipS = (db and db.pipSize) or 1
     local pipW, pipH = PIP_WIDTH * pipS, PIP_HEIGHT * pipS
     local gapX = PIP_GAP * pipS
-    local pipRowW = PIP_COUNT * pipW + (PIP_COUNT - 1) * gapX
-
-    local barW = BASE_WIDTH * barWm
-    return pipW, pipH, gapX, PIP_GAP, BAR_HEIGHT * barHm, math.max(barW, pipRowW), barW, pipRowW
+    return pipW, pipH, gapX, PIP_GAP, PIP_COUNT * pipW + (PIP_COUNT - 1) * gapX
 end
 
 -- Bars stack downward for now; the vertical/horizontal direction toggle arrives with the
--- container work.
+-- container work. Each bar carries its own size, so they are centred against each other -
+-- left-aligning bars of different widths just looks like a mistake.
 local BAR_GAP = 2
 
-local function barsAreaHeight(barH)
-    return #bars * barH + (#bars - 1) * BAR_GAP
+-- per-bar settings live in db.bars[key]; before that exists everything falls back to 1/on
+local function barSettings(key)
+    return db and db.bars and db.bars[key]
 end
 
-local function layoutBars(barW, barH, x, y)
-    for _, bar in ipairs(bars) do
-        bar.frame:SetSize(barW, barH)
-        bar.frame:ClearAllPoints()
-        bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", x, y)
-        y = y - barH - BAR_GAP
+local function barSize(bar)
+    local s = barSettings(bar.def.key)
+    return BASE_WIDTH * ((s and s.w) or 1), BAR_HEIGHT * ((s and s.h) or 1)
+end
+
+local function barEnabled(bar)
+    local s = barSettings(bar.def.key)
+    return s == nil or s.on ~= false
+end
+
+-- bars in the user's chosen order; falls back to definition order before db loads
+local function orderedBars()
+    local out = {}
+    for _, key in ipairs((db and db.barOrder) or {}) do
+        local bar = barsByKey[key]
+        if bar then out[#out + 1] = bar end
+    end
+    if #out == 0 then return bars end
+    return out
+end
+
+local function barsAreaSize()
+    local maxW, totalH, shown = 0, 0, 0
+    for _, bar in ipairs(orderedBars()) do
+        if barEnabled(bar) then
+            local w, h = barSize(bar)
+            if w > maxW then maxW = w end
+            totalH = totalH + h
+            shown = shown + 1
+        end
+    end
+    if shown > 1 then totalH = totalH + (shown - 1) * BAR_GAP end
+    return maxW, totalH
+end
+
+-- Creates any missing per-bar settings and keeps the order list honest. Called at load, so a
+-- new BAR_DEFS entry just appears at the bottom rather than needing a migration. The width and
+-- height a bar starts with come from the old single barWidth/barHeight pair, so upgrading does
+-- not change how anything looks.
+local function ensureBarSettings()
+    db.bars = db.bars or {}
+    for _, def in ipairs(BAR_DEFS) do
+        local s = db.bars[def.key]
+        if not s then
+            s = { w = db.barWidth or 1, h = db.barHeight or 1, on = true }
+            db.bars[def.key] = s
+        end
+        if s.on == nil then s.on = true end
+        s.w, s.h = s.w or 1, s.h or 1
+    end
+
+    local order, seen = {}, {}
+    for _, key in ipairs(db.barOrder or {}) do
+        if barsByKey[key] and not seen[key] then
+            order[#order + 1], seen[key] = key, true
+        end
+    end
+    for _, def in ipairs(BAR_DEFS) do          -- anything new goes on the end
+        if not seen[def.key] then order[#order + 1] = def.key end
+    end
+    db.barOrder = order
+end
+
+-- sizes and positions only; showing/hiding is barRefreshVisibility's job
+local function layoutBars(frameW, y)
+    for _, bar in ipairs(orderedBars()) do
+        if barEnabled(bar) then
+            local w, h = barSize(bar)
+            bar.frame:SetSize(w, h)
+            bar.frame:ClearAllPoints()
+            bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", (frameW - w) / 2, y)
+            y = y - h - BAR_GAP
+        else
+            bar.frame:Hide()
+        end
     end
 end
 
@@ -305,15 +382,18 @@ end
 -- Slice and Dice bar (default) or above it; either way the frame is re-sized to fit, so
 -- each bar's countdowns (anchored to its frame via SetAllPoints) follow automatically.
 local function applySize()
-    local pipW, pipH, gapX, gapY, barH, frameW, barW, pipRowW = metrics()
-    local barsH = barsAreaHeight(barH)
+    local pipW, pipH, gapX, gapY, pipRowW = metrics()
+    local barsW, barsH = barsAreaSize()
+    local showPips = (db == nil) or db.showPips
+    -- the frame is as wide as the widest row in it; everything narrower is centred
+    local frameW = math.max(barsW, showPips and pipRowW or 0)
 
     -- Pips off: the frame is just the bars. Hiding the holders takes their ghosts and gated
     -- bars with them, so nothing else needs to know.
-    if db and not db.showPips then
+    if not showPips then
         for _, pip in ipairs(pips) do pip.holder:Hide() end
-        root:SetSize(barW, barsH)
-        layoutBars(barW, barH, 0, 0)
+        root:SetSize(frameW, barsH)
+        layoutBars(frameW, 0)
         return
     end
     for _, pip in ipairs(pips) do pip.holder:Show() end
@@ -322,16 +402,14 @@ local function applySize()
     local top = db and db.pipsOnTop
     local pipY = top and 0 or -(barsH + gapY)
     local barY = top and -(pipH + gapY) or 0
-    -- centre the narrower row against the wider one
     local pipX = (frameW - pipRowW) / 2
-    local barX = (frameW - barW) / 2
 
     for i, pip in ipairs(pips) do
         pip.holder:SetSize(pipW, pipH)
         pip.holder:ClearAllPoints()
         pip.holder:SetPoint("TOPLEFT", root, "TOPLEFT", pipX + (i - 1) * (pipW + gapX), pipY)
     end
-    layoutBars(barW, barH, barX, barY)
+    layoutBars(frameW, barY)
 end
 
 -- ---------------------------------------------------------------- combo points
@@ -349,6 +427,7 @@ end
 local pendingCP -- secret combo point count captured as the cast is sent
 
 local function barRefreshVisibility(bar)
+    if not barEnabled(bar) then bar.frame:Hide(); return end
     local idle = not bar.start
     bar.placeholder:SetShown(idle)
     bar.frame:SetShown(not idle or (db ~= nil and not db.locked))
@@ -371,7 +450,15 @@ local function barStart(bar, start, lengths, open)
     bar.start = start
     for i, t in ipairs(bar.timers) do
         t.length = lengths[i]
-        if t.gate then t.gate:SetValue(open) end
+        if t.gate then
+            -- open is the secret combo point count. For a per-target bar it has been parked
+            -- in a table and read back out, which is not a verified path for secrets - if the
+            -- client refuses it, open every gate instead. That shows the longest countdown,
+            -- which overestimates rather than showing nothing.
+            if not pcall(t.gate.SetValue, t.gate, open) then
+                t.gate:SetValue(PIP_COUNT)
+            end
+        end
         t.bar:SetMinMaxValues(0, t.length)
         t.holder:Show()
     end
@@ -693,6 +780,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
             if db[k] == nil then db[k] = v end
         end
         if not SHAPE_SET[db.pipShape] then db.pipShape = DEFAULTS.pipShape end
+        ensureBarSettings()
         applyShape()
         applySize()
         applyPosition()
@@ -744,17 +832,22 @@ local function setScale(scale)
     if panel and panel:IsShown() then panel.refresh() end
 end
 
-local function setBarWidth(w)
-    db.barWidth = w
+-- The slash commands predate per-bar sizing and have no bar to aim at, so they set every
+-- bar. Per-bar sizing lives in the settings panel.
+local function setAllBars(w, h)
+    for _, def in ipairs(BAR_DEFS) do
+        local s = db.bars and db.bars[def.key]
+        if s then
+            if w then s.w = w end
+            if h then s.h = h end
+        end
+    end
     applySize()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
-local function setBarHeight(h)
-    db.barHeight = h
-    applySize()
-    if panel and panel:IsShown() then panel.refresh() end
-end
+local function setBarWidth(w)  setAllBars(w, nil) end
+local function setBarHeight(h) setAllBars(nil, h) end
 
 local function setPipSize(s)
     db.pipSize = s
@@ -767,6 +860,39 @@ local function setShape(shape)
     applyShape()
     writeStore()
     if panel and panel:IsShown() then panel.refresh() end
+end
+
+local function setBarSize(key, w, h)
+    local s = db.bars and db.bars[key]
+    if not s then return end
+    if w then s.w = w end
+    if h then s.h = h end
+    applySize()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+local function setBarEnabled(key, on)
+    local s = db.bars and db.bars[key]
+    if not s then return end
+    s.on = on
+    applySize()
+    refreshBarVisibility()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+-- delta -1 moves the bar up the stack, +1 down
+local function moveBar(key, delta)
+    local order = db.barOrder
+    for i, k in ipairs(order) do
+        if k == key then
+            local j = i + delta
+            if j < 1 or j > #order then return end
+            order[i], order[j] = order[j], order[i]
+            applySize()
+            if panel and panel:IsShown() then panel.refresh() end
+            return
+        end
+    end
 end
 
 local function setShowPips(show)
@@ -787,7 +913,11 @@ end
 
 local function resetPosition()
     db.point = { unpack(DEFAULTS.point) }
-    db.scale, db.barWidth, db.barHeight, db.pipSize = 1, 1, 1, 1
+    db.scale, db.pipSize = 1, 1
+    for _, def in ipairs(BAR_DEFS) do
+        local s = db.bars and db.bars[def.key]
+        if s then s.w, s.h = 1, 1 end
+    end
     applyPosition()
     applySize()
     writeStore()
@@ -896,7 +1026,7 @@ end
 
 local function buildPanel()
     local p = CreateFrame("Frame", "CutthroatOptions", UIParent)
-    p:SetSize(PANEL_W, 468)
+    p:SetSize(PANEL_W, 468)   -- height is recomputed below, once the sections are laid out
     p:SetPoint("CENTER")
     p:SetFrameStrata("DIALOG")
     p:SetClampedToScreen(true)
@@ -944,31 +1074,76 @@ local function buildPanel()
         if math.abs(v - db.scale) > 0.001 then db.scale = v; applyScale(); writeStore() end
     end, IN)
 
-    -- ---- Slice and Dice bar ----
-    sectionHeader(p, -128, "SLICE AND DICE BAR")
-    sectionBox(p, -142, -204)
-    local barWidthSlider = makeSlider(p, -150, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Bar width  %.2f", function(v)
-        if math.abs(v - db.barWidth) > 0.001 then db.barWidth = v; applySize() end
+    -- ---- Timer bars ----
+    -- One row per bar: reorder arrows, the name (click to select it), and an on/off toggle.
+    -- The two sliders underneath act on whichever bar is selected - a width and a height
+    -- slider on every row would never fit at this width. Rows are positional: row i shows
+    -- whatever bar currently sits at that place in db.barOrder, so reordering just relabels
+    -- them. Offsets are derived from the bar count so another bar does not break the layout.
+    local ROW_H, nBars = 24, #BAR_DEFS
+    local rowsTop    = -150
+    local wSliderY   = rowsTop - nBars * ROW_H - 12
+    local hSliderY   = wSliderY - 30
+    local barsBottom = hSliderY - 24
+
+    sectionHeader(p, -128, "TIMER BARS")
+    sectionBox(p, -142, barsBottom)
+
+    local selectedBar = BAR_DEFS[1].key
+    local barRows = {}
+    for i = 1, nBars do
+        local y, row = rowsTop - (i - 1) * ROW_H, {}
+        row.up = makeButton(p, "^", 16, function() moveBar(row.key, -1) end, 18)
+        row.up:SetPoint("TOPLEFT", IN, y)
+        row.down = makeButton(p, "v", 16, function() moveBar(row.key, 1) end, 18)
+        row.down:SetPoint("TOPLEFT", IN + 18, y)
+        row.name = makeButton(p, "", 128, function()
+            selectedBar = row.key
+            p.refresh()
+        end, 18)
+        row.name:SetPoint("TOPLEFT", IN + 38, y)
+        row.sel = row.name:CreateTexture(nil, "BORDER")
+        row.sel:SetAllPoints()
+        row.sel:SetColorTexture(0.30, 0.38, 0.68, 0.75)
+        row.toggle = makeButton(p, "", 56, function()
+            local s = db.bars and db.bars[row.key]
+            if s then setBarEnabled(row.key, not s.on) end
+        end, 18)
+        row.toggle:SetPoint("TOPRIGHT", -IN, y)
+        barRows[i] = row
+    end
+
+    local barWidthSlider = makeSlider(p, wSliderY, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Width  %.2f", function(v)
+        local s = db.bars and db.bars[selectedBar]
+        if s and math.abs(v - s.w) > 0.001 then setBarSize(selectedBar, v, nil) end
     end, IN)
-    local barHeightSlider = makeSlider(p, -180, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Bar height  %.2f", function(v)
-        if math.abs(v - db.barHeight) > 0.001 then db.barHeight = v; applySize() end
+    local barHeightSlider = makeSlider(p, hSliderY, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Height  %.2f", function(v)
+        local s = db.bars and db.bars[selectedBar]
+        if s and math.abs(v - s.h) > 0.001 then setBarSize(selectedBar, nil, v) end
     end, IN)
 
     -- ---- Combo points ----
-    sectionHeader(p, -216, "COMBO POINTS")
+    local comboTop    = barsBottom - 26
+    local pipSizeY    = comboTop - 8
+    local placementY  = pipSizeY - 34
+    local shapeY      = placementY - 24
+    local gridTop     = shapeY - 18
+    local comboBottom = gridTop - 2 * 28 - 8
+
+    sectionHeader(p, barsBottom - 12, "COMBO POINTS")
     -- Pip visibility. It was folded into Placement at first and nobody could find it, so it
     -- gets its own control - parked in the empty space beside the bottom row of shape
     -- buttons (the grid ends at x=194, the content edge is 260), which costs no extra height.
     local showButton = makeButton(p, "", 58, function() setShowPips(not db.showPips) end)
-    showButton:SetPoint("TOPRIGHT", -IN, -343)
-    sectionBox(p, -230, -374)
-    local pipSizeSlider = makeSlider(p, -238, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Pip size  %.2f", function(v)
+    showButton:SetPoint("TOPRIGHT", -IN, gridTop - 29)
+    sectionBox(p, comboTop, comboBottom)
+    local pipSizeSlider = makeSlider(p, pipSizeY, SIZE_MIN, SIZE_MAX, SIZE_STEP, "Pip size  %.2f", function(v)
         if math.abs(v - db.pipSize) > 0.001 then db.pipSize = v; applySize() end
     end, IN)
 
     -- pip shape: one icon button per shape
     local shapeLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    shapeLabel:SetPoint("TOPLEFT", IN, -296)
+    shapeLabel:SetPoint("TOPLEFT", IN, shapeY)
     shapeLabel:SetText("Shape")
     local shapeButtons = {}
     local SHAPE_COLS = 6   -- 6 x 30px = 180px, comfortably inside the 252px content width
@@ -977,7 +1152,7 @@ local function buildPanel()
         local col = (idx - 1) % SHAPE_COLS
         local b = CreateFrame("Button", nil, p)
         b:SetSize(24, 24)
-        b:SetPoint("TOPLEFT", IN + col * 30, -314 - row * 28)
+        b:SetPoint("TOPLEFT", IN + col * 30, gridTop - row * 28)
         local selected = b:CreateTexture(nil, "BACKGROUND")
         selected:SetPoint("TOPLEFT", -3, 3)
         selected:SetPoint("BOTTOMRIGHT", 3, -3)
@@ -1007,18 +1182,20 @@ local function buildPanel()
 
     -- combo points above or below the Slice and Dice bar
     local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    layoutLabel:SetPoint("TOPLEFT", IN, -272)
+    layoutLabel:SetPoint("TOPLEFT", IN, placementY)
     layoutLabel:SetText("Placement")
     local layoutButton = makeButton(p, "", 142, function() setPipsOnTop(not db.pipsOnTop) end)
-    layoutButton:SetPoint("TOPRIGHT", -IN, -268)
+    layoutButton:SetPoint("TOPRIGHT", -IN, placementY + 4)
 
     -- reset
     local resetButton = makeButton(p, "Reset size and position", 252, resetPosition)
-    resetButton:SetPoint("TOPLEFT", 14, -390)
+    resetButton:SetPoint("TOPLEFT", 14, comboBottom - 16)
 
     -- read-only info
     local info = p:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-    info:SetPoint("TOPLEFT", 14, -422)
+    info:SetPoint("TOPLEFT", 14, comboBottom - 48)
+    -- now that the sections know their own heights, size the panel to fit them
+    p:SetSize(PANEL_W, -comboBottom + 94)
     info:SetPoint("RIGHT", -14, 0)
     info:SetJustifyH("LEFT")
 
@@ -1026,10 +1203,28 @@ local function buildPanel()
         lockButton.text:SetText(db.locked and "Locked" or "Unlocked (drag the bar)")
         scaleSlider:SetValue(db.scale)
         scaleSlider.label:SetFormattedText("Scale  %.2f", db.scale)
-        barWidthSlider:SetValue(db.barWidth)
-        barWidthSlider.label:SetFormattedText("Bar width  %.2f", db.barWidth)
-        barHeightSlider:SetValue(db.barHeight)
-        barHeightSlider.label:SetFormattedText("Bar height  %.2f", db.barHeight)
+        -- rows are positional, so relabel each one from the current order
+        for i, row in ipairs(barRows) do
+            local key = db.barOrder and db.barOrder[i]
+            row.key = key
+            local bar = key and barsByKey[key]
+            if bar then
+                local s = db.bars[key]
+                row.name.text:SetText(bar.def.label)
+                row.toggle.text:SetText(s.on and "On" or "Off")
+                row.name:SetAlpha(s.on and 1 or 0.45)
+                row.sel:SetShown(key == selectedBar)
+                row.up:SetShown(i > 1)
+                row.down:SetShown(i < #barRows)
+            end
+        end
+        local sel = db.bars and db.bars[selectedBar]
+        if sel then
+            barWidthSlider:SetValue(sel.w)
+            barWidthSlider.label:SetFormattedText("Width  %.2f", sel.w)
+            barHeightSlider:SetValue(sel.h)
+            barHeightSlider.label:SetFormattedText("Height  %.2f", sel.h)
+        end
         pipSizeSlider:SetValue(db.pipSize)
         pipSizeSlider.label:SetFormattedText("Pip size  %.2f", db.pipSize)
         for shape, b in pairs(shapeButtons) do b.selected:SetShown(shape == db.pipShape) end
