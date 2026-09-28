@@ -46,6 +46,19 @@ local BAR_DEFS = {
         unit     = "player",
         multKey  = "sndMult",
     },
+    {
+        key       = "expose",
+        label     = "Expose Armor",
+        spellIDs  = { [8647] = true, [8649] = true, [8650] = true,   -- ranks 1-5
+                      [11197] = true, [11198] = true },
+        seconds   = 30,        -- fixed: combo points change the armor reduction, not the
+                               -- duration. Corrected from the real debuff by learnKey below.
+        color     = { 0.85, 0.55, 0.20 },
+        unit      = "target",
+        harmful   = true,      -- a debuff on the target, not a buff on us
+        perTarget = true,      -- one countdown per target GUID
+        learnKey  = "exposeSeconds",
+    },
 }
 
 local DEFAULTS = {
@@ -189,7 +202,7 @@ applyShape()
 -- countdowns 1..cp are visible and the right one, cp, draws on top. A fixed-duration bar
 -- needs none of that - one countdown, no gates.
 local function createBar(def)
-    local bar = { def = def, start = nil, timers = {} }
+    local bar = { def = def, start = nil, timers = {}, byGuid = {} }
 
     local frame = CreateFrame("Frame", nil, root)
     frame:SetSize(width, BAR_HEIGHT)
@@ -271,14 +284,20 @@ local function metrics()
     return pipW, pipH, gapX, PIP_GAP, BAR_HEIGHT * barHm, math.max(barW, pipRowW), barW, pipRowW
 end
 
--- Places every bar in the bar area. Only one bar exists today, so this is a single frame at
--- the given spot; stacking / side-by-side arrives with the container work.
+-- Bars stack downward for now; the vertical/horizontal direction toggle arrives with the
+-- container work.
+local BAR_GAP = 2
+
+local function barsAreaHeight(barH)
+    return #bars * barH + (#bars - 1) * BAR_GAP
+end
+
 local function layoutBars(barW, barH, x, y)
     for _, bar in ipairs(bars) do
         bar.frame:SetSize(barW, barH)
         bar.frame:ClearAllPoints()
         bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", x, y)
-        y = y - barH
+        y = y - barH - BAR_GAP
     end
 end
 
@@ -287,20 +306,21 @@ end
 -- each bar's countdowns (anchored to its frame via SetAllPoints) follow automatically.
 local function applySize()
     local pipW, pipH, gapX, gapY, barH, frameW, barW, pipRowW = metrics()
+    local barsH = barsAreaHeight(barH)
 
-    -- Pips off: the frame is just the bar. Hiding the holders takes their ghosts and gated
+    -- Pips off: the frame is just the bars. Hiding the holders takes their ghosts and gated
     -- bars with them, so nothing else needs to know.
     if db and not db.showPips then
         for _, pip in ipairs(pips) do pip.holder:Hide() end
-        root:SetSize(barW, barH)
+        root:SetSize(barW, barsH)
         layoutBars(barW, barH, 0, 0)
         return
     end
     for _, pip in ipairs(pips) do pip.holder:Show() end
-    root:SetSize(frameW, pipH + gapY + barH)
+    root:SetSize(frameW, pipH + gapY + barsH)
 
     local top = db and db.pipsOnTop
-    local pipY = top and 0 or -(barH + gapY)
+    local pipY = top and 0 or -(barsH + gapY)
     local barY = top and -(pipH + gapY) or 0
     -- centre the narrower row against the wider one
     local pipX = (frameW - pipRowW) / 2
@@ -393,7 +413,14 @@ root:SetScript("OnUpdate", guard("OnUpdate", function(_, elapsed)
     sinceUpdate = 0
     local now = GetTime()
     for _, bar in ipairs(bars) do
-        if bar.start and not barUpdate(bar, now) then barStop(bar) end
+        if bar.start and not barUpdate(bar, now) then
+            -- a per-target countdown that ran out is done for that mob too
+            if bar.def.perTarget then
+                local guid = UnitGUID("target")
+                if guid then bar.byGuid[guid] = nil end
+            end
+            barStop(bar)
+        end
     end
 end))
 
@@ -407,7 +434,10 @@ end
 -- seconds per countdown for a fresh cast, talent multiplier applied
 local function castLengths(bar)
     local def = bar.def
-    if type(def.seconds) == "number" then return { def.seconds } end
+    -- a learned duration (read off the real aura) wins over the assumed one
+    if type(def.seconds) == "number" then
+        return { (def.learnKey and db[def.learnKey]) or def.seconds }
+    end
     local mult = (def.multKey and db[def.multKey]) or 1
     local lengths = {}
     for i = 1, PIP_COUNT do lengths[i] = def.seconds[i] * mult end
@@ -420,12 +450,58 @@ local function onCastSent(spellID)
     end
 end
 
+-- ---------------------------------------------------------------- per-target bars
+-- A debuff belongs to the mob it was cast on, not to us, so those bars keep one countdown per
+-- target GUID: casting on a second mob does not wipe the first, and changing target swaps
+-- which countdown is on screen. GUIDs are plain values and usable as table keys even in
+-- combat, unlike the combo point count.
+--
+-- Limitation worth knowing: a miss, dodge, resist or dispel cannot be seen in combat, because
+-- debuffs are unreadable there. The bar will happily count down a debuff that never landed.
+local function pruneExpired(bar, now)
+    for guid, entry in pairs(bar.byGuid) do
+        local longest = 0
+        for _, len in ipairs(entry.lengths) do
+            if len > longest then longest = len end
+        end
+        if now > entry.start + longest then bar.byGuid[guid] = nil end
+    end
+end
+
+local function barShowForTarget(bar)
+    local guid = UnitGUID("target")
+    local entry = guid and bar.byGuid[guid]
+    if entry then
+        barStart(bar, entry.start, entry.lengths, entry.open or PIP_COUNT)
+    else
+        barStop(bar)
+    end
+end
+
+local function refreshTargetBars()
+    local now = GetTime()
+    for _, bar in ipairs(bars) do
+        if bar.def.perTarget then
+            pruneExpired(bar, now)
+            barShowForTarget(bar)
+        end
+    end
+end
+
 local function onCastSucceeded(spellID)
     local bar = barForSpell(spellID)
     if not bar then return end
     local cp = pendingCP or GetComboPoints("player", "target") or 0
     pendingCP = nil
-    barStart(bar, GetTime(), castLengths(bar), cp)
+
+    if bar.def.perTarget then
+        local guid = UnitGUID("target")
+        if not guid then return end   -- nothing to attach the timer to
+        bar.byGuid[guid] = { start = GetTime(), lengths = castLengths(bar), open = cp }
+        barShowForTarget(bar)
+    else
+        barStart(bar, GetTime(), castLengths(bar), cp)
+    end
 end
 
 -- Only callable while auras are readable (out of combat); throws otherwise.
@@ -464,9 +540,14 @@ local function syncBar(bar)
 end
 
 -- Replace the cast-based estimate with the real aura whenever the client lets us see it.
+-- Per-target bars sit this out: reading a debuff off the target needs aura APIs that have not
+-- been verified on this client, and a half-working sync would fight the cast timer. Their
+-- countdowns stay cast-driven for now.
 local function syncFromBuff()
     if aurasHidden() then return end
-    for _, bar in ipairs(bars) do syncBar(bar) end
+    for _, bar in ipairs(bars) do
+        if not bar.def.perTarget then syncBar(bar) end
+    end
 end
 
 -- ---------------------------------------------------------------- position and lock
@@ -639,6 +720,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
             C_Timer.After(3, guard("readStore", readStore))
         end
         updateComboPoints()
+        refreshTargetBars()   -- a new target has its own debuff timers, or none
         syncFromBuff()
     end
 end))
