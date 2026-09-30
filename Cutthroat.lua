@@ -76,6 +76,8 @@ local BAR_DEFS = {
 local DEFAULTS = {
     locked = false, scale = 1, barWidth = 1, barHeight = 1, pipSize = 1,
     sndMult = 1, pipShape = "square", pipsOnTop = false, showPips = true,
+    barLayout = "vertical",   -- or "horizontal"
+    alwaysShowPips = false,   -- keep empty pip sockets on screen at zero combo points
     point = { "CENTER", "CENTER", 0, -180 },
 }
 -- media\<shape>.tga is the fill; media\<shape>_border.tga is the same shape grown for the outline
@@ -186,23 +188,44 @@ for i = 1, PIP_COUNT do
     pips[i] = { holder = holder, ghost = ghost, ghostBorder = ghostBorder, outline = gatedBar(1), fill = gatedBar(2) }
 end
 
+-- The ghost textures do two different jobs and look different for each:
+--   unlocked   - a positioning aid: every pip solid in its real colour, easy to line up
+--   empty pips - a permanent socket: hollow and dim, so earned pips still stand out
+-- Unlocked wins when both apply. Filling the sockets in colour would make it look like you
+-- always had five combo points, which is the opposite of useful.
+local function applyPipGhosts()
+    local shape = (db and db.pipShape) or DEFAULTS.pipShape
+    local fill, border = MEDIA .. shape .. ".tga", MEDIA .. shape .. "_border.tga"
+    local unlocked = db ~= nil and not db.locked
+    local sockets  = db ~= nil and db.alwaysShowPips
+    for i, pip in ipairs(pips) do
+        if unlocked then
+            local c = PIP_COLORS[i]
+            pip.ghostBorder:SetTexture(border)
+            pip.ghostBorder:SetVertexColor(0, 0, 0, 0.9)
+            pip.ghost:SetTexture(fill)
+            pip.ghost:SetVertexColor(c[1], c[2], c[3], 0.9)
+        elseif sockets then
+            pip.ghostBorder:SetTexture(border)
+            pip.ghostBorder:SetVertexColor(0, 0, 0, 0.55)
+            pip.ghost:SetTexture(border)   -- the outline, not the fill: an empty socket
+            pip.ghost:SetVertexColor(0.55, 0.55, 0.62, 0.35)
+        end
+        pip.ghost:SetShown(unlocked or sockets)
+        pip.ghostBorder:SetShown(unlocked or sockets)
+    end
+end
+
 local function applyShape()
     local shape = db and db.pipShape or DEFAULTS.pipShape
     local fill, border = MEDIA .. shape .. ".tga", MEDIA .. shape .. "_border.tga"
     for i, pip in ipairs(pips) do
-        -- Ghost is the unlocked-only preview: each pip solid in its real colour, with a dark
-        -- border underneath, so all five are easy to see and line up against other bars. It's
-        -- hidden the instant you lock, leaving only real combo points.
-        local c = PIP_COLORS[i]
-        pip.ghostBorder:SetTexture(border)
-        pip.ghostBorder:SetVertexColor(0, 0, 0, 0.9)
-        pip.ghost:SetTexture(fill)
-        pip.ghost:SetVertexColor(c[1], c[2], c[3], 0.9)
         pip.outline:SetStatusBarTexture(border)
         pip.outline:SetStatusBarColor(0, 0, 0, 1)
         pip.fill:SetStatusBarTexture(fill)
         pip.fill:SetStatusBarColor(unpack(PIP_COLORS[i]))
     end
+    applyPipGhosts()
 end
 applyShape()
 
@@ -321,18 +344,25 @@ local function orderedBars()
     return out
 end
 
+local function horizontal()
+    return db ~= nil and db.barLayout == "horizontal"
+end
+
+-- Stacked: as wide as the widest bar, as tall as all of them plus the gaps.
+-- Side by side: the other way round.
 local function barsAreaSize()
-    local maxW, totalH, shown = 0, 0, 0
+    local maxW, maxH, sumW, sumH, shown = 0, 0, 0, 0, 0
     for _, bar in ipairs(orderedBars()) do
         if barEnabled(bar) then
             local w, h = barSize(bar)
             if w > maxW then maxW = w end
-            totalH = totalH + h
-            shown = shown + 1
+            if h > maxH then maxH = h end
+            sumW, sumH, shown = sumW + w, sumH + h, shown + 1
         end
     end
-    if shown > 1 then totalH = totalH + (shown - 1) * BAR_GAP end
-    return maxW, totalH
+    local gaps = shown > 1 and (shown - 1) * BAR_GAP or 0
+    if horizontal() then return sumW + gaps, maxH end
+    return maxW, sumH + gaps
 end
 
 -- Creates any missing per-bar settings and keeps the order list honest. Called at load, so a
@@ -363,15 +393,24 @@ local function ensureBarSettings()
     db.barOrder = order
 end
 
--- sizes and positions only; showing/hiding is barRefreshVisibility's job
+-- Sizes and positions only; showing/hiding is barRefreshVisibility's job. Bars are centred
+-- across whichever axis they are not laid out along, so differing sizes read as deliberate.
 local function layoutBars(frameW, y)
+    local horiz = horizontal()
+    local barsW, barsH = barsAreaSize()
+    local x = (frameW - barsW) / 2
     for _, bar in ipairs(orderedBars()) do
         if barEnabled(bar) then
             local w, h = barSize(bar)
             bar.frame:SetSize(w, h)
             bar.frame:ClearAllPoints()
-            bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", (frameW - w) / 2, y)
-            y = y - h - BAR_GAP
+            if horiz then
+                bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", x, y - (barsH - h) / 2)
+                x = x + w + BAR_GAP
+            else
+                bar.frame:SetPoint("TOPLEFT", root, "TOPLEFT", (frameW - w) / 2, y)
+                y = y - h - BAR_GAP
+            end
         else
             bar.frame:Hide()
         end
@@ -656,10 +695,7 @@ local function applyLock()
     root:EnableMouse(unlocked)
     overlay:SetShown(unlocked)
     hint:SetShown(unlocked)
-    for _, pip in ipairs(pips) do
-        pip.ghost:SetShown(unlocked)
-        pip.ghostBorder:SetShown(unlocked)
-    end
+    applyPipGhosts()
     refreshBarVisibility()
 end
 
@@ -698,7 +734,8 @@ local function writeStore()
     store:ClearAllPoints()
     store:SetPoint("CENTER", UIParent, "CENTER",
         100 + shapeIndex + (db.locked and 20 or 0) + (db.pipsOnTop and 40 or 0)
-            + (db.showPips and 0 or 80),
+            + (db.showPips and 0 or 80) + (db.barLayout == "horizontal" and 160 or 0)
+            + (db.alwaysShowPips and 320 or 0),
         math.floor(db.scale * 100 + 0.5))
     store:SetUserPlaced(true)
 end
@@ -710,10 +747,16 @@ local function readStore()
     if not (x and y) then return end
     x, y = math.floor(x + 0.5), math.floor(y + 0.5)
 
-    -- unpack largest flag first: 100 + index (+20 locked, +40 above, +80 pips hidden)
-    local index, locked, onTop, showPips
+    -- unpack largest flag first:
+    -- 100 + index (+20 locked, +40 pips above, +80 pips hidden, +160 side by side,
+    -- +320 empty pips shown)
+    local index, locked, onTop, showPips, horiz, sockets
     if x >= 100 then
         local rest = x - 100
+        sockets = rest > 320
+        if sockets then rest = rest - 320 end
+        horiz = rest > 160
+        if horiz then rest = rest - 160 end
         showPips = not (rest > 80)
         if not showPips then rest = rest - 80 end
         onTop = rest > 40
@@ -728,7 +771,7 @@ local function readStore()
         locked = rest > 10
         if locked then rest = rest - 10 end
         if rest > 5 then return end       -- only five shapes existed back then
-        index, showPips = rest, true
+        index, showPips, horiz, sockets = rest, true, false, false
     else
         return
     end
@@ -738,6 +781,8 @@ local function readStore()
     storeRead = true
     db.pipShape, db.locked, db.scale, db.pipsOnTop, db.showPips =
         shape, locked, scale, onTop, showPips
+    db.barLayout = horiz and "horizontal" or "vertical"
+    db.alwaysShowPips = sockets
     applyShape()
     applyScale()
     applyLock()
@@ -877,6 +922,20 @@ local function setBarEnabled(key, on)
     s.on = on
     applySize()
     refreshBarVisibility()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+local function setAlwaysShowPips(on)
+    db.alwaysShowPips = on
+    applyPipGhosts()
+    writeStore()
+    if panel and panel:IsShown() then panel.refresh() end
+end
+
+local function setBarLayout(mode)
+    db.barLayout = mode
+    applySize()
+    writeStore()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -1081,13 +1140,22 @@ local function buildPanel()
     -- whatever bar currently sits at that place in db.barOrder, so reordering just relabels
     -- them. Offsets are derived from the bar count so another bar does not break the layout.
     local ROW_H, nBars = 24, #BAR_DEFS
-    local rowsTop    = -150
+    local layoutY    = -150
+    local rowsTop    = layoutY - 30
     local wSliderY   = rowsTop - nBars * ROW_H - 12
     local hSliderY   = wSliderY - 30
     local barsBottom = hSliderY - 24
 
     sectionHeader(p, -128, "TIMER BARS")
     sectionBox(p, -142, barsBottom)
+
+    local dirLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    dirLabel:SetPoint("TOPLEFT", IN, layoutY)
+    dirLabel:SetText("Layout")
+    local dirButton = makeButton(p, "", 142, function()
+        setBarLayout(horizontal() and "vertical" or "horizontal")
+    end)
+    dirButton:SetPoint("TOPRIGHT", -IN, layoutY + 4)
 
     local selectedBar = BAR_DEFS[1].key
     local barRows = {}
@@ -1125,7 +1193,8 @@ local function buildPanel()
     -- ---- Combo points ----
     local comboTop    = barsBottom - 26
     local pipSizeY    = comboTop - 8
-    local placementY  = pipSizeY - 34
+    local emptyY      = pipSizeY - 34
+    local placementY  = emptyY - 30
     local shapeY      = placementY - 24
     local gridTop     = shapeY - 18
     local comboBottom = gridTop - 2 * 28 - 8
@@ -1182,6 +1251,14 @@ local function buildPanel()
 
     -- combo points above or below the Slice and Dice bar
     local layoutLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    local emptyLabel = p:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    emptyLabel:SetPoint("TOPLEFT", IN, emptyY)
+    emptyLabel:SetText("Empty pips")
+    local emptyButton = makeButton(p, "", 142, function()
+        setAlwaysShowPips(not db.alwaysShowPips)
+    end)
+    emptyButton:SetPoint("TOPRIGHT", -IN, emptyY + 4)
+
     layoutLabel:SetPoint("TOPLEFT", IN, placementY)
     layoutLabel:SetText("Placement")
     local layoutButton = makeButton(p, "", 142, function() setPipsOnTop(not db.pipsOnTop) end)
@@ -1203,6 +1280,7 @@ local function buildPanel()
         lockButton.text:SetText(db.locked and "Locked" or "Unlocked (drag the bar)")
         scaleSlider:SetValue(db.scale)
         scaleSlider.label:SetFormattedText("Scale  %.2f", db.scale)
+        dirButton.text:SetText(horizontal() and "Side by side" or "Stacked")
         -- rows are positional, so relabel each one from the current order
         for i, row in ipairs(barRows) do
             local key = db.barOrder and db.barOrder[i]
@@ -1232,9 +1310,12 @@ local function buildPanel()
         -- state: "Hide" while the pips are showing, "Show" while they are hidden
         showButton.text:SetText(db.showPips and "Hide" or "Show")
         layoutButton.text:SetText(db.pipsOnTop and "Above the bar" or "Below the bar")
+        emptyButton.text:SetText(db.alwaysShowPips and "Always shown" or "Hidden until earned")
         -- nothing else in this section does anything while the pips are hidden
         local lit = db.showPips and 1 or 0.3
         pipSizeSlider:SetAlpha(lit);  pipSizeSlider:EnableMouse(db.showPips)
+        emptyButton:SetAlpha(lit);    emptyButton:EnableMouse(db.showPips)
+        emptyLabel:SetAlpha(lit)
         layoutButton:SetAlpha(lit);   layoutButton:EnableMouse(db.showPips)
         layoutLabel:SetAlpha(lit)
         shapeLabel:SetAlpha(lit)
@@ -1267,7 +1348,7 @@ SlashCmdList.CUTTHROAT = function(msg)
         local ok, err = pcall(togglePanel)
         if not ok then
             print(PREFIX .. "settings panel failed to open: " .. tostring(err))
-            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | barwidth <n> | barheight <n> | pipsize <n> | pips above|below|show|hide")
+            print(PREFIX .. "the typed commands still work: /cut lock | unlock | reset | scale <n> | barwidth <n> | barheight <n> | pipsize <n> | pips above|below|show|hide|empty")
         end
     elseif cmd == "lock" then
         setLocked(true)
@@ -1298,6 +1379,11 @@ SlashCmdList.CUTTHROAT = function(msg)
         elseif arg == "show" or arg == "on" then
             setShowPips(true)
             print(PREFIX .. "combo points shown.")
+        elseif arg == "empty" then
+            setAlwaysShowPips(not db.alwaysShowPips)
+            print(PREFIX .. (db.alwaysShowPips
+                and "empty combo points always shown."
+                or  "combo points appear as they are earned."))
         else
             print(PREFIX .. "usage: /cut pips above | below | show | hide")
         end
@@ -1334,6 +1420,6 @@ SlashCmdList.CUTTHROAT = function(msg)
             print(PREFIX .. "usage: /cut pipsize 0.5-3  (e.g. /cut pipsize 1.5)")
         end
     else
-        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale | barwidth | barheight | pipsize <0.5-3> | shape <name> | pips above|below|show|hide")
+        print(PREFIX .. "/cut opens settings. Also: /cut lock | unlock | reset | scale | barwidth | barheight | pipsize <0.5-3> | shape <name> | pips above|below|show|hide|empty")
     end
 end
