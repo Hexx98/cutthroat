@@ -676,6 +676,54 @@ local function syncFromBuff()
     end
 end
 
+-- ---------------------------------------------------------------- /cut check
+-- The debuff durations and rank spell IDs the bars are built on are assumptions. Out of
+-- combat the real values are readable, so this dumps whatever is on the target: if a rank ID
+-- is wrong the spell shows up here with its real one, and the duration is right beside it.
+-- Results also go to CutthroatDB.probe, which survives to the next reload.
+local function probeTarget()
+    if not UnitExists("target") then
+        print(PREFIX .. "no target - target something with the debuff on it.")
+        return
+    end
+    if aurasHidden() then
+        print(PREFIX .. "auras are hidden in combat. Step out of combat and try again " ..
+                        "while the debuff is still ticking.")
+        return
+    end
+
+    local api, get
+    if C_UnitAuras.GetDebuffDataByIndex then
+        api = "GetDebuffDataByIndex"
+        get = function(i) return C_UnitAuras.GetDebuffDataByIndex("target", i) end
+    elseif C_UnitAuras.GetAuraDataByIndex then
+        api = "GetAuraDataByIndex(HARMFUL)"
+        get = function(i) return C_UnitAuras.GetAuraDataByIndex("target", i, "HARMFUL") end
+    end
+    if not get then
+        print(PREFIX .. "this client has no readable debuff API.")
+        db.probe = { when = date("%H:%M:%S"), api = "none" }
+        return
+    end
+
+    local out = { when = date("%H:%M:%S"), api = api, target = UnitName("target"), rows = {} }
+    print(PREFIX .. "target debuffs via " .. api .. ":")
+    for i = 1, 40 do
+        local ok, aura = pcall(get, i)
+        if not ok or not aura then break end
+        local id, name, dur = aura.spellId, aura.name, aura.duration
+        local row = string.format("%s  id=%s  duration=%s",
+            tostring(name), tostring(id), tostring(dur))
+        local bar = isReadable(id) and barForSpell(id)
+        if bar then row = row .. "   <- matches " .. bar.def.label end
+        out.rows[#out.rows + 1] = row
+        print("   " .. row)
+    end
+    if #out.rows == 0 then print("   (none)") end
+    db.probe = out
+    print(PREFIX .. "saved to CutthroatDB.probe (written on /reload or logout).")
+end
+
 -- ---------------------------------------------------------------- position and lock
 -- Re-anchors the bar at the saved point: only at load and on reset. WoW's layout cache
 -- may have restored a dragged position that a lost saved point knows nothing about.
@@ -1356,6 +1404,8 @@ SlashCmdList.CUTTHROAT = function(msg)
     elseif cmd == "unlock" then
         setLocked(false)
         print(PREFIX .. "unlocked. Drag it where you like, then /cut lock")
+    elseif cmd == "check" then
+        probeTarget()
     elseif cmd == "reset" then
         resetPosition()
         print(PREFIX .. "position and scale reset.")
