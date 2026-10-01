@@ -490,10 +490,13 @@ local function barStart(bar, start, lengths, open)
     for i, t in ipairs(bar.timers) do
         t.length = lengths[i]
         if t.gate then
-            -- open is the secret combo point count. For a per-target bar it has been parked
-            -- in a table and read back out, which is not a verified path for secrets - if the
-            -- client refuses it, open every gate instead. That shows the longest countdown,
-            -- which overestimates rather than showing nothing.
+            -- open is the secret combo point count, and for a per-target bar it has been
+            -- parked in a table and read back out. That round-trip was verified working
+            -- 2026-09-30: secrets survive being stored as table *values* (only table keys are
+            -- refused), so a bar returns at the right length when you switch back to a mob.
+            -- The pcall stays as cheap insurance - a refusal here would otherwise throw in
+            -- the cast path - and falls back to opening every gate, which overestimates
+            -- rather than showing nothing.
             if not pcall(t.gate.SetValue, t.gate, open) then
                 t.gate:SetValue(PIP_COUNT)
             end
@@ -676,6 +679,19 @@ local function syncFromBuff()
     end
 end
 
+-- ---------------------------------------------------------------- the combat log is closed
+-- Settled 2026-09-30: registering COMBAT_LOG_EVENT_UNFILTERED raises ADDON_ACTION_FORBIDDEN -
+-- it is a *protected* event here, not merely a silent one. Do not try again, and do not
+-- re-add a watcher to check; the attempt itself taints the addon and errors on every load.
+--
+-- This is the secret-value system working as designed. The combat log is the largest possible
+-- side channel for hidden combat state, so it is closed to addons outright.
+--
+-- The consequence worth knowing: UNIT_SPELLCAST_SUCCEEDED means the ability went off, not
+-- that it connected. A dodged or parried finisher still spends energy and combo points, so a
+-- countdown starts for a debuff that never landed, and nothing in combat can tell us
+-- otherwise. Correcting that has to wait until combat ends and auras are readable again.
+
 -- ---------------------------------------------------------------- /cut check
 -- The debuff durations and rank spell IDs the bars are built on are assumptions. Out of
 -- combat the real values are readable, so this dumps whatever is on the target: if a rank ID
@@ -692,34 +708,61 @@ local function probeTarget()
         return
     end
 
-    local api, get
-    if C_UnitAuras.GetDebuffDataByIndex then
-        api = "GetDebuffDataByIndex"
-        get = function(i) return C_UnitAuras.GetDebuffDataByIndex("target", i) end
-    elseif C_UnitAuras.GetAuraDataByIndex then
-        api = "GetAuraDataByIndex(HARMFUL)"
-        get = function(i) return C_UnitAuras.GetAuraDataByIndex("target", i, "HARMFUL") end
+    local out = { when = date("%H:%M:%S"), target = UnitName("target"), rows = {} }
+    local function say(s)
+        print("   " .. s)
+        out.rows[#out.rows + 1] = s
     end
-    if not get then
-        print(PREFIX .. "this client has no readable debuff API.")
-        db.probe = { when = date("%H:%M:%S"), api = "none" }
-        return
+    print(PREFIX .. "aura probe:")
+    say("combat=" .. tostring(InCombatLockdown()) .. "  aurasHidden=" .. tostring(aurasHidden()))
+
+    -- what this client actually offers, rather than what we assume it does
+    local okList, names = pcall(function()
+        local t = {}
+        for k, v in pairs(C_UnitAuras) do
+            if type(v) == "function" then t[#t + 1] = k end
+        end
+        table.sort(t)
+        return t
+    end)
+    say("C_UnitAuras: " .. (okList and table.concat(names, ", ") or "<could not list>"))
+
+    -- walk one aura source and report what came back; player buffs are the control, since
+    -- those are known to work out of combat
+    local function walk(label, fn)
+        local n, first = 0, nil
+        for i = 1, 40 do
+            local ok, a = pcall(fn, i)
+            if not ok then say(label .. ": ERROR " .. tostring(a)); return end
+            if not a then break end
+            n = n + 1
+            local id = a.spellId
+            local bar = isReadable(id) and barForSpell(id)
+            local row = string.format("%s id=%s dur=%s%s", tostring(a.name), tostring(id),
+                tostring(a.duration), bar and ("  <- " .. bar.def.label) or "")
+            if n <= 6 then say("    " .. row) end
+            first = first or row
+        end
+        say(label .. ": " .. n .. " found")
     end
 
-    local out = { when = date("%H:%M:%S"), api = api, target = UnitName("target"), rows = {} }
-    print(PREFIX .. "target debuffs via " .. api .. ":")
-    for i = 1, 40 do
-        local ok, aura = pcall(get, i)
-        if not ok or not aura then break end
-        local id, name, dur = aura.spellId, aura.name, aura.duration
-        local row = string.format("%s  id=%s  duration=%s",
-            tostring(name), tostring(id), tostring(dur))
-        local bar = isReadable(id) and barForSpell(id)
-        if bar then row = row .. "   <- matches " .. bar.def.label end
-        out.rows[#out.rows + 1] = row
-        print("   " .. row)
+    walk("player buffs (control)", function(i) return C_UnitAuras.GetBuffDataByIndex("player", i) end)
+    if C_UnitAuras.GetDebuffDataByIndex then
+        walk("target debuffs", function(i) return C_UnitAuras.GetDebuffDataByIndex("target", i) end)
+    else
+        say("target debuffs: GetDebuffDataByIndex does not exist")
     end
-    if #out.rows == 0 then print("   (none)") end
+    if C_UnitAuras.GetAuraDataByIndex then
+        walk("target HARMFUL", function(i) return C_UnitAuras.GetAuraDataByIndex("target", i, "HARMFUL") end)
+    else
+        say("target HARMFUL: GetAuraDataByIndex does not exist")
+    end
+    if C_UnitAuras.GetBuffDataByIndex then
+        walk("target buffs", function(i) return C_UnitAuras.GetBuffDataByIndex("target", i) end)
+    end
+
+    say("combat log: protected on this client (registering it raises ADDON_ACTION_FORBIDDEN)")
+
     db.probe = out
     print(PREFIX .. "saved to CutthroatDB.probe (written on /reload or logout).")
 end
