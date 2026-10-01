@@ -880,6 +880,87 @@ local function readStore()
     applySize()
 end
 
+-- ---------------------------------------------------------------- per-bar settings store
+-- The single helper frame above is full: one frame only carries two numbers, and the global
+-- settings already use both. So every bar gets its own named frame and its own pair.
+--
+-- Width and height are 0.5 to 3 in steps of 0.05, which is 51 possible values each, so they
+-- are stored as an index rather than multiplied up. That keeps the offsets small enough to
+-- stay unremarkable on screen while still carrying the order and the on/off flag:
+--   x = width index + 51 * (position in the order - 1)
+--   y = height index + 51 * (0 when enabled, 1 when disabled)
+local SIZE_STEPS = math.floor((SIZE_MAX - SIZE_MIN) / SIZE_STEP + 0.5)   -- 50, so 51 values
+local SPAN = SIZE_STEPS + 1
+
+local function sizeIndex(v)
+    local i = math.floor(((v or 1) - SIZE_MIN) / SIZE_STEP + 0.5)
+    return math.max(0, math.min(SIZE_STEPS, i))
+end
+local function sizeFromIndex(i) return SIZE_MIN + i * SIZE_STEP end
+
+local barStores = {}
+for _, def in ipairs(BAR_DEFS) do
+    local f = CreateFrame("Frame", "CutthroatBarStore_" .. def.key, UIParent)
+    f:SetSize(1, 1)
+    f:SetAlpha(0)
+    f:EnableMouse(false)
+    f:SetMovable(true)   -- required for WoW to remember its position
+    barStores[def.key] = f
+end
+local barStoresRead = false
+
+local function writeBarStores()
+    if not (db and db.bars and db.barOrder) then return end
+    for pos, key in ipairs(db.barOrder) do
+        local f, s = barStores[key], db.bars[key]
+        if f and s then
+            f:ClearAllPoints()
+            f:SetPoint("CENTER", UIParent, "CENTER",
+                sizeIndex(s.w) + SPAN * (pos - 1),
+                sizeIndex(s.h) + SPAN * (s.on and 0 or 1))
+            f:SetUserPlaced(true)
+        end
+    end
+end
+
+local function readBarStores()
+    if barStoresRead or not (db and db.bars) then return end
+    local positions, found = {}, false
+    for key, f in pairs(barStores) do
+        if f:GetNumPoints() > 0 then
+            local _, _, _, x, y = f:GetPoint(1)
+            local s = db.bars[key]
+            if x and y and s then
+                x, y = math.floor(x + 0.5), math.floor(y + 0.5)
+                local pos, wIdx = math.floor(x / SPAN) + 1, x % SPAN
+                local off, hIdx = y >= SPAN, y % SPAN
+                if x >= 0 and y >= 0 and wIdx <= SIZE_STEPS and hIdx <= SIZE_STEPS then
+                    s.w, s.h, s.on = sizeFromIndex(wIdx), sizeFromIndex(hIdx), not off
+                    positions[pos] = key
+                    found = true
+                end
+            end
+        end
+    end
+    if not found then return end
+    barStoresRead = true
+
+    -- rebuild the order from the recovered positions, appending anything that was missing
+    local order, seen = {}, {}
+    for i = 1, SPAN * #BAR_DEFS do
+        local key = positions[i]
+        if key and not seen[key] then
+            order[#order + 1], seen[key] = key, true
+        end
+    end
+    for _, def in ipairs(BAR_DEFS) do
+        if not seen[def.key] then order[#order + 1] = def.key end
+    end
+    db.barOrder = order
+    applySize()
+    refreshBarVisibility()
+end
+
 -- ---------------------------------------------------------------- events
 local function registerPlayerEvent(event)
     if root.RegisterUnitEvent and pcall(root.RegisterUnitEvent, root, event, "player") then return end
@@ -922,6 +1003,7 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         applyPosition()
         applyLock()
         readStore() -- in case the layout cache was applied before us
+        readBarStores()
         root:UnregisterEvent("ADDON_LOADED")
     elseif event == "PLAYER_LOGOUT" then
         if db then
@@ -940,8 +1022,9 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
         if event == "PLAYER_ENTERING_WORLD" then
             -- the layout cache is applied shortly after addons load; look a few times
             readStore()
-            C_Timer.After(1, guard("readStore", readStore))
-            C_Timer.After(3, guard("readStore", readStore))
+            readBarStores()
+            C_Timer.After(1, guard("readStore", function() readStore(); readBarStores() end))
+            C_Timer.After(3, guard("readStore", function() readStore(); readBarStores() end))
         end
         updateComboPoints()
         refreshTargetBars()   -- a new target has its own debuff timers, or none
@@ -979,6 +1062,7 @@ local function setAllBars(w, h)
         end
     end
     applySize()
+    writeBarStores()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -1004,6 +1088,7 @@ local function setBarSize(key, w, h)
     if w then s.w = w end
     if h then s.h = h end
     applySize()
+    writeBarStores()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -1013,6 +1098,7 @@ local function setBarEnabled(key, on)
     s.on = on
     applySize()
     refreshBarVisibility()
+    writeBarStores()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
@@ -1039,6 +1125,7 @@ local function moveBar(key, delta)
             if j < 1 or j > #order then return end
             order[i], order[j] = order[j], order[i]
             applySize()
+            writeBarStores()
             if panel and panel:IsShown() then panel.refresh() end
             return
         end
@@ -1071,6 +1158,7 @@ local function resetPosition()
     applyPosition()
     applySize()
     writeStore()
+    writeBarStores()
     if panel and panel:IsShown() then panel.refresh() end
 end
 
