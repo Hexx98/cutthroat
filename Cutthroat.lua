@@ -635,11 +635,15 @@ end
 
 -- Only callable while auras are readable (out of combat); throws otherwise.
 local function findAura(bar)
+    local def = bar.def
+    -- a debuff bar has to ask the debuff list; both calls exist on this client
+    local get = def.harmful and C_UnitAuras.GetDebuffDataByIndex or C_UnitAuras.GetBuffDataByIndex
+    if not get then return nil end
     for i = 1, 40 do
-        local aura = C_UnitAuras.GetBuffDataByIndex(bar.def.unit, i)
+        local aura = get(def.unit, i)
         if not aura then return nil end
         local id = aura.spellId
-        if isReadable(id) and bar.def.spellIDs[id] then return aura end
+        if isReadable(id) and def.spellIDs[id] then return aura end
     end
 end
 
@@ -679,6 +683,42 @@ local function syncFromBuff()
     end
 end
 
+-- Per-target bars run on the cast, because nothing in combat can tell a finisher that landed
+-- from one that was dodged. The moment combat ends auras are readable again, and this is the
+-- only chance to put that right: if the debuff is not actually on the target, the countdown
+-- was a phantom and gets dropped. If it is there, its real timing replaces the estimate.
+local function reconcileTargetBars()
+    if aurasHidden() then return end
+    local guid = UnitGUID("target")
+    if not guid then return end
+
+    for _, bar in ipairs(bars) do
+        if bar.def.perTarget and bar.byGuid[guid] then
+            local ok, aura = pcall(findAura, bar)
+            if ok and not aura then
+                bar.byGuid[guid] = nil        -- it never landed, or it has gone
+                barShowForTarget(bar)
+            elseif ok then
+                local exp, dur = aura.expirationTime, aura.duration
+                if isReadable(exp) and isReadable(dur) and dur > 0 then
+                    local lengths = {}
+                    for i = 1, #bar.timers do lengths[i] = dur end
+                    bar.byGuid[guid] = { start = exp - dur, lengths = lengths, open = PIP_COUNT }
+                    barShowForTarget(bar)
+
+                    -- a fixed-duration bar can learn its real length from the real thing
+                    local def = bar.def
+                    if def.learnKey and type(def.seconds) == "number" then
+                        local okB, base = pcall(C_UnitAuras.GetAuraBaseDuration,
+                                                def.unit, aura.auraInstanceID)
+                        if okB and isReadable(base) and base > 0 then db[def.learnKey] = base end
+                    end
+                end
+            end
+        end
+    end
+end
+
 -- ---------------------------------------------------------------- the combat log is closed
 -- Settled 2026-09-30: registering COMBAT_LOG_EVENT_UNFILTERED raises ADDON_ACTION_FORBIDDEN -
 -- it is a *protected* event here, not merely a silent one. Do not try again, and do not
@@ -698,16 +738,9 @@ end
 -- is wrong the spell shows up here with its real one, and the duration is right beside it.
 -- Results also go to CutthroatDB.probe, which survives to the next reload.
 local function probeTarget()
-    if not UnitExists("target") then
-        print(PREFIX .. "no target - target something with the debuff on it.")
-        return
-    end
-    if aurasHidden() then
-        print(PREFIX .. "auras are hidden in combat. Step out of combat and try again " ..
-                        "while the debuff is still ticking.")
-        return
-    end
-
+    -- Nothing bails out early any more. Reading Blizzard's own frames needs no aura access,
+    -- so it works in combat - which is the only time a debuff is reliably up. Only the aura
+    -- dump below is gated, and it says so rather than abandoning the whole run.
     local out = { when = date("%H:%M:%S"), target = UnitName("target"), rows = {} }
     local function say(s)
         print("   " .. s)
@@ -746,6 +779,12 @@ local function probeTarget()
         say(label .. ": " .. n .. " found")
     end
 
+    if aurasHidden() then
+        say("aura dump SKIPPED - auras are hidden in combat. Re-run out of combat for this")
+        say("part; the widget checks below work either way.")
+    elseif not UnitExists("target") then
+        say("aura dump SKIPPED - no target.")
+    else
     walk("player buffs (control)", function(i) return C_UnitAuras.GetBuffDataByIndex("player", i) end)
     if C_UnitAuras.GetDebuffDataByIndex then
         walk("target debuffs", function(i) return C_UnitAuras.GetDebuffDataByIndex("target", i) end)
@@ -760,8 +799,122 @@ local function probeTarget()
     if C_UnitAuras.GetBuffDataByIndex then
         walk("target buffs", function(i) return C_UnitAuras.GetBuffDataByIndex("target", i) end)
     end
+    end
 
     say("combat log: protected on this client (registering it raises ADDON_ACTION_FORBIDDEN)")
+
+    -- Blizzard's own target frame renders the debuff correctly, because its code is untainted
+    -- and can read the real aura. The question is whether any of that survives being read back
+    -- off the widgets by addon code. Expectation is no - this is the first workaround anyone
+    -- would try - but it is read-only and cannot taint anything, so it is worth knowing.
+    say("-- Blizzard target frame debuff widgets --")
+    local seen = 0
+    for i = 1, 8 do
+        local name = "TargetFrameDebuff" .. i
+        local b = _G[name]
+        if b then
+            seen = seen + 1
+            local parts = { name }
+
+            local okS, shown = pcall(b.IsShown, b)
+            parts[#parts + 1] = "shown=" .. (okS and tostring(shown) or "ERR")
+
+            local icon = b.icon or b.Icon or _G[name .. "Icon"]
+            if icon and icon.GetTexture then
+                local okT, tex = pcall(icon.GetTexture, icon)
+                parts[#parts + 1] = "texture=" .. (not okT and "ERR"
+                    or (not isReadable(tex) and "<SECRET>" or tostring(tex)))
+            else
+                parts[#parts + 1] = "texture=<no icon region>"
+            end
+
+            local cd = b.cooldown or b.Cooldown or _G[name .. "Cooldown"]
+            if cd and cd.GetCooldownTimes then
+                local okC, start, dur = pcall(cd.GetCooldownTimes, cd)
+                parts[#parts + 1] = "cd=" .. (not okC and "ERR"
+                    or ((not isReadable(start) or not isReadable(dur)) and "<SECRET>"
+                        or string.format("start=%s dur=%s", tostring(start), tostring(dur))))
+            else
+                parts[#parts + 1] = "cd=<none>"
+            end
+
+            say("  " .. table.concat(parts, "  "))
+        end
+    end
+    if seen == 0 then
+        -- TargetFrameDebuffN is the classic layout and does not exist here, so find out what
+        -- this client actually calls them before guessing again.
+        -- Alphabetical truncation hid the Target* ones last time, so filter rather than cap,
+        -- and read each one instead of only naming it - the readability is the whole question.
+        say("  no TargetFrameDebuffN globals. Target-related debuff frames, with their values:")
+        local okG, names = pcall(function()
+            local t = {}
+            for k, v in pairs(_G) do
+                if type(k) == "string" and k:find("Target") and k:find("Debuff")
+                   and not k:find("Icon") and not k:find("Cooldown") and not k:find("Border")
+                   and type(v) == "table" and v.IsShown then
+                    t[#t + 1] = k
+                end
+            end
+            table.sort(t)
+            return t
+        end)
+        if okG and #names > 0 then
+            for i = 1, math.min(#names, 10) do
+                local n, b = names[i], _G[names[i]]
+                local parts = { n }
+
+                local okS, shown = pcall(b.IsShown, b)
+                parts[#parts + 1] = "shown=" .. (okS and tostring(shown) or "ERR")
+
+                local icon = b.icon or b.Icon or _G[n .. "Icon"]
+                if icon and icon.GetTexture then
+                    local okT, tex = pcall(icon.GetTexture, icon)
+                    parts[#parts + 1] = "texture=" .. (not okT and "ERR"
+                        or (not isReadable(tex) and "<SECRET>" or tostring(tex)))
+                else
+                    parts[#parts + 1] = "texture=<none>"
+                end
+
+                local cd = b.cooldown or b.Cooldown or _G[n .. "Cooldown"]
+                if cd and cd.GetCooldownTimes then
+                    local okC, st, du = pcall(cd.GetCooldownTimes, cd)
+                    parts[#parts + 1] = "cd=" .. (not okC and "ERR"
+                        or ((not isReadable(st) or not isReadable(du)) and "<SECRET>"
+                            or string.format("%s/%s", tostring(st), tostring(du))))
+                else
+                    parts[#parts + 1] = "cd=<none>"
+                end
+
+                say("    " .. table.concat(parts, "  "))
+            end
+            say("    (" .. #names .. " target-related debuff frames)")
+        else
+            say("    none found")
+        end
+
+        -- walk TargetFrame's children looking for anything that smells like an aura button
+        local okC, kids = pcall(function()
+            local t = {}
+            local function walk(f, depth, path)
+                if depth > 3 or not f.GetChildren then return end
+                for _, c in ipairs({ f:GetChildren() }) do
+                    local n = c.GetName and c:GetName() or "?"
+                    if (c.cooldown or c.Cooldown or c.icon or c.Icon) and #t < 10 then
+                        t[#t + 1] = path .. "/" .. tostring(n)
+                    end
+                    walk(c, depth + 1, path .. "/" .. tostring(n))
+                end
+            end
+            if TargetFrame then walk(TargetFrame, 1, "TargetFrame") end
+            return t
+        end)
+        if okC and #kids > 0 then
+            for _, k in ipairs(kids) do say("    child with icon/cooldown: " .. k) end
+        else
+            say("    no icon/cooldown children under TargetFrame")
+        end
+    end
 
     db.probe = out
     print(PREFIX .. "saved to CutthroatDB.probe (written on /reload or logout).")
@@ -1027,8 +1180,9 @@ root:SetScript("OnEvent", guard("OnEvent", function(_, event, ...)
             C_Timer.After(3, guard("readStore", function() readStore(); readBarStores() end))
         end
         updateComboPoints()
-        refreshTargetBars()   -- a new target has its own debuff timers, or none
+        refreshTargetBars()      -- a new target has its own debuff timers, or none
         syncFromBuff()
+        reconcileTargetBars()    -- out of combat, drop any countdown whose debuff never landed
     end
 end))
 
